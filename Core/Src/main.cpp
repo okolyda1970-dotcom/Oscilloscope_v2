@@ -190,10 +190,12 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == UART5)
     {
-        // Обработка ошибок UART (опционально)
-        __HAL_UART_CLEAR_FLAG(huart, UART_FLAG_PE | UART_FLAG_FE | UART_FLAG_NE | UART_FLAG_ORE);
+        __HAL_UART_CLEAR_FLAG(huart, UART_FLAG_PE | UART_FLAG_FE |
+                                      UART_FLAG_NE | UART_FLAG_ORE);
+        UartProtocol::errorCallback(huart);   // приём перезапустится сам
     }
 }
+
 
 /* USER CODE BEGIN 0 */
 /* USER CODE BEGIN 0 */
@@ -421,6 +423,10 @@ int main(void)
 
    // === НАСТРОЙКА ЧАСТОТЫ ===
    setDefaultRegisters();
+   // СНАЧАЛА приём — до первой отправки:
+   HAL_UART_RegisterCallback(&huart5, HAL_UART_TX_COMPLETE_CB_ID, UartProtocol::txCompleteCallback);
+   HAL_UART_RegisterCallback(&huart5, HAL_UART_RX_COMPLETE_CB_ID,  UartProtocol::rxCompleteCallback);
+   uart.armRx();
    // === ОТПРАВКА НА ЗОНД ===
    uint32_t reg1 = remoteInit1();
    uint32_t reg2 = remoteInit2();
@@ -431,10 +437,8 @@ int main(void)
  //  LL_mDelay(200);
    calculateRegisters(freq, &reg1, &reg2);
    uart.sendCommand(reg1, reg2);
-   HAL_Delay(20);
 
-   HAL_UART_RegisterCallback(&huart5, HAL_UART_TX_COMPLETE_CB_ID, UartProtocol::txCompleteCallback);
-   HAL_UART_RegisterCallback(&huart5, HAL_UART_RX_COMPLETE_CB_ID, UartProtocol::rxCompleteCallback);
+   uart.armRx();   // приём взведён один раз — дальше он поддерживает себя сам
 
 /*   // === ЖЁСТКАЯ ОТПРАВКА (без функций) ===
    uint8_t rawCommand[9] = {
@@ -477,9 +481,9 @@ int main(void)
 	    // === ОТПРАВКА КОМАНДЫ ===
 	    uart.sendCommand(reg1, reg2);
 	    HAL_Delay(50);
-	    if (huart5.gState == HAL_UART_STATE_READY) {
+/*	    if (huart5.gState == HAL_UART_STATE_READY) {
 	        HAL_UART_Receive_IT(&huart5, uart.mRxBuffer, 9);
-	    }
+	    }*/
 	    // === МИГАЕМ СВЕТОДИОДОМ ПРИ ОТПРАВКЕ ===
 	    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_15);
 
