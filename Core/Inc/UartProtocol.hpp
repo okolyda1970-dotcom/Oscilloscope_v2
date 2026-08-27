@@ -2,43 +2,59 @@
 #define UARTPROTOCOL_HPP_
 
 #include "stm32h7xx_hal.h"
-#include <stdint.h>
+#include "Registers.hpp"
 
 class UartProtocol {
 public:
-    // Конструктор: передаём хендл UART и DMA
+    // === КОНСТРУКТОР И ДЕСТРУКТОР ===
     UartProtocol(UART_HandleTypeDef* huart);
+    ~UartProtocol();
 
-    // Отправка данных на зонд (32-битные регистры)
+    // === ОРИГИНАЛЬНЫЕ МЕТОДЫ ОТПРАВКИ ===
     void sendCommand(uint32_t reg1, uint32_t reg2);
-
-    // Проверка, завершена ли отправка
-    bool isTransmitComplete() const;
-
-    // Колбэк завершения передачи (вызывается из HAL)
-    static void txCompleteCallback(UART_HandleTypeDef* huart);
-    static void rxCompleteCallback(UART_HandleTypeDef* huart);
-    void armRx();                                   // взвести приём
-    static void errorCallback(UART_HandleTypeDef* huart);  // перезапуск после ошибки
-    void resetReceiver();   // чистое перевзведение окна приёма
-    bool isRxComplete() const;
+    void armRx();
     void clearRxFlag();
-    uint8_t mTxBuffer[9];  // 8 байт данных + 1 байт CRC
-    volatile bool mTxComplete = true;
-    volatile bool mRxComplete = false;
-    uint8_t mRxBuffer[9];  // 8 байт данных + 1 байт CRC
-private:
+    void resetReceiver();
+
+    // === НОВЫЕ МЕТОДЫ УПРАВЛЕНИЯ ЗОНДОМ ===
+    bool sendRegisters(uint32_t reg1, uint32_t reg2);
+    bool setFrequency(float freqMhz);
+    bool setRfOutput(bool enable);
+
+    // === ГЕТТЕРЫ ===
+    uint32_t getSuccessCount() const { return successCount; }
+    uint32_t getErrorCount() const { return errorCount; }
+    float getCurrentFrequency() const { return currentFrequency; }
+    bool isRfEnabled() const { return rfEnabled; }
+
+    // === БУФЕРЫ (публичные для диагностики) ===
+    uint8_t mTxBuffer[9];
+    uint8_t mRxBuffer[9];
+    volatile bool mTxComplete;
+    volatile bool mRxComplete;
     UART_HandleTypeDef* mHuart;
 
+    // === СТАТИЧЕСКИЕ КОЛБЭКИ ===
+    static void txCompleteCallback(UART_HandleTypeDef* huart);
+    static void rxCompleteCallback(UART_HandleTypeDef* huart);
+    static void errorCallback(UART_HandleTypeDef* huart);
+
+private:
+    // === ДАННЫЕ ДЛЯ УПРАВЛЕНИЯ ЗОНДОМ ===
+    float currentFrequency;
+    bool rfEnabled;
+    uint32_t successCount;
+    uint32_t errorCount;
+
+    // === РАСЧЁТ РЕГИСТРОВ ===
+    void calculateRegisters(float freqMhz, uint32_t* reg1, uint32_t* reg2);
+
+    // === СТАТИЧЕСКИЙ УКАЗАТЕЛЬ НА ЭКЗЕМПЛЯР ===
+    static UartProtocol* mInstance;
+
+    // === ФЛАГИ СОСТОЯНИЯ ===
     static volatile bool flagTx;
     static volatile bool flagRx;
-
-
-    // Расчет контрольной суммы (CRC8)
-    uint8_t calculateCRC(const uint8_t* data, uint8_t len);
-
-    // Статический указатель для колбэка
-    static UartProtocol* mInstance;
 };
 
 #endif // UARTPROTOCOL_HPP_
