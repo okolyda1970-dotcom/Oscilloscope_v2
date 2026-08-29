@@ -16,7 +16,6 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
@@ -55,6 +54,9 @@ DMA_HandleTypeDef hdma_adc1;
 DMA_HandleTypeDef hdma_adc2;
 
 SPI_HandleTypeDef hspi1;
+
+TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart5;
 DMA_HandleTypeDef hdma_uart5_rx;
 
@@ -68,13 +70,12 @@ ButtonRead btnRead;
 uint16_t adcBuffer[ADC_BUFFER_SIZE];
 
 // === ПАРАМЕТРЫ СКАНЕРА ===
-const float startFreq = 35.0;
-const float stopFreq = 4400.0;
-const uint8_t spectrumPoints = 160;
-const float stepFreq = (stopFreq - startFreq) / spectrumPoints;
+const float scanStartFreq = 1000.0;   // Начало (МГц)
+const float scanStepFreq = 1.0;       // Шаг (МГц)
+const uint8_t scanPoints = 160;       // Количество точек = ширина дисплея
 
-// === МАССИВ СПЕКТРА ===
-uint16_t spectrum[160];
+// === ТЕКУЩАЯ ПОЗИЦИЯ СКАНИРОВАНИЯ ===
+uint8_t scanIndex = 0;
 
 volatile uint8_t flagAdc = 0;
 /* USER CODE END PV */
@@ -88,6 +89,7 @@ static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_UART5_Init(void);
+static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -118,86 +120,38 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
-    if (hadc->Instance == ADC1) {
+    if (hadc->Instance == ADC2) {   // ← было ADC1
         flagAdc = 1;
     }
 }
 
+// === ИЗМЕРЕНИЕ СИГНАЛА НА ТЕКУЩЕЙ ЧАСТОТЕ ===
+uint16_t measureSignal() {
+    // Запускаем АЦП через DMA
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adcBuffer, ADC_BUFFER_SIZE);
 
-// === ОТРИСОВКА СПЕКТРА ===
-// === ДИАГНОСТИКА АЦП ===
-void scanSpectrum() {
-    // Запускаем АЦП в ручном режиме (без DMA)
-    HAL_ADC_Start(&hadc1);
+    // Ждём заполнения буфера
+    HAL_Delay(10);
 
-    for (uint8_t i = 0; i < spectrumPoints; i++) {
-        float freq = startFreq + i * stepFreq;
+    // Останавливаем АЦП
+    HAL_ADC_Stop_DMA(&hadc1);
 
-        // Устанавливаем частоту на зонде
-        uart.setFrequency(freq);
-
-        // Ждём стабилизации
-        HAL_Delay(10);
-
-        // Читаем 100 значений АЦП вручную
-        uint32_t sum = 0;
-        for (uint16_t j = 0; j < 100; j++) {
-            HAL_ADC_PollForConversion(&hadc1, 10);
-            sum += HAL_ADC_GetValue(&hadc1);
-        }
-        spectrum[i] = sum / 100;
+    // Вычисляем среднее значение
+    uint32_t sum = 0;
+    for (uint16_t j = 0; j < ADC_BUFFER_SIZE; j++) {
+        sum += adcBuffer[j];
     }
-
-    HAL_ADC_Stop(&hadc1);
-}
-
-// === ОТРИСОВКА СПЕКТРА С ДИАГНОСТИКОЙ ===
-void drawSpectrum() {
-    display.clearArea(0, 0, 160, 128, COLOR_WHITE);
-
-    // Находим максимальное и минимальное значения
-    uint16_t maxVal = 0;
-    uint16_t minVal = 65535;
-    for (uint8_t i = 0; i < spectrumPoints; i++) {
-        if (spectrum[i] > maxVal) maxVal = spectrum[i];
-        if (spectrum[i] < minVal) minVal = spectrum[i];
-    }
-
-    // === ДИАГНОСТИКА: показываем значения ===
-    char str[64];
-    sprintf(str, "MIN:%d MAX:%d", minVal, maxVal);
-    display.drawString(0, 0, str, COLOR_BLACK, COLOR_WHITE);
-
-    // Показываем первые 5 значений спектра
-    sprintf(str, "S[0]:%d S[1]:%d", spectrum[0], spectrum[1]);
-    display.drawString(0, 12, str, COLOR_BLACK, COLOR_WHITE);
-
-    sprintf(str, "S[2]:%d S[3]:%d", spectrum[2], spectrum[3]);
-    display.drawString(0, 24, str, COLOR_BLACK, COLOR_WHITE);
-
-    // === Рисуем спектр ===
-    if (maxVal > 0) {
-        for (uint8_t i = 0; i < spectrumPoints; i++) {
-            uint8_t height = (uint8_t)((uint32_t)spectrum[i] * 80 / maxVal);
-            if (height > 80) height = 80;
-
-            if (height > 0) {
-                display.drawLine(i, 119, i, 119 - height, COLOR_RED, 0);
-            }
-        }
-    }
-
-    // Подпись диапазона
-    sprintf(str, "%.0f-%.0f MHz", startFreq, stopFreq);
-    display.drawString(0, 120, str, COLOR_BLACK, COLOR_WHITE);
+    return sum / ADC_BUFFER_SIZE;
 }
 /* USER CODE END 0 */
+
 /**
   * @brief  The application entry point.
   * @retval int
   */
 int main(void)
 {
+
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -228,9 +182,14 @@ int main(void)
   MX_ADC2_Init();
   MX_SPI1_Init();
   MX_UART5_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  HAL_Delay(500);
   display.init();
   display.clear(COLOR_WHITE);
+
+  // Калибровка АЦП2 (наш детектор)
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
 
   // Настройка начальных регистров
   setDefaultRegisters();
@@ -239,34 +198,68 @@ int main(void)
   HAL_UART_RegisterCallback(&huart5, HAL_UART_TX_COMPLETE_CB_ID, UartProtocol::txCompleteCallback);
   HAL_UART_RegisterCallback(&huart5, HAL_UART_RX_COMPLETE_CB_ID, UartProtocol::rxCompleteCallback);
 
-  // Начальная установка частоты на зонде
-  uart.setFrequency(100.0);
+  // === ПРОШИВАЕМ ЗОНД ОДИН РАЗ НА 60 МГц ===
+  uart.setFrequency(60.0);
   uart.setRfOutput(true);
 
-  // Приветствие на дисплее
-  display.drawString(0, 50, "Spectrum Analyzer", COLOR_BLACK, COLOR_WHITE);
-  display.drawString(0, 65, "Starting scan...", COLOR_BLACK, COLOR_WHITE);
-  HAL_Delay(1000);
+  // Заголовок
+  display.drawString(0, 0, "RF PATH TEST: 60MHz", COLOR_BLACK, COLOR_WHITE);
+
+  // Рамка для столбика
+  for (int16_t x = 65; x <= 95; x++) {
+      display.drawVLine(x, 20, 100, COLOR_BLACK);
+  }
+  display.clearArea(66, 21, 28, 98, COLOR_WHITE);
+
+  HAL_Delay(500);
   /* USER CODE END 2 */
 
   /* Infinite loop */
-
   /* USER CODE BEGIN WHILE */
   while (1) {
-      // Сканируем спектр
-      scanSpectrum();
+      char str[64];
 
-      // Выводим на дисплей
-      drawSpectrum();
+      // === ИЗМЕРЯЕМ СИГНАЛ С АЦП2 ===
+      HAL_ADC_Start_DMA(&hadc2, (uint32_t*)adcBuffer, ADC_BUFFER_SIZE);
+      HAL_Delay(10);
+      HAL_ADC_Stop_DMA(&hadc2);
 
-      // Пауза между сканами
-      HAL_Delay(500);
-      /* USER CODE END WHILE */
+      uint32_t sum = 0;
+      uint16_t minVal = 65535;
+      uint16_t maxVal = 0;
+      for (uint16_t j = 0; j < ADC_BUFFER_SIZE; j++) {
+          uint16_t val = adcBuffer[j];
+          sum += val;
+          if (val < minVal) minVal = val;
+          if (val > maxVal) maxVal = val;
+      }
+      uint16_t avg = sum / ADC_BUFFER_SIZE;
 
-      /* USER CODE BEGIN 3 */
+      // === ОЧИЩАЕМ ОБЛАСТЬ СТОЛБИКА ===
+      display.clearArea(66, 21, 28, 98, COLOR_WHITE);
+
+      // === РИСУЕМ СТОЛБИК ===
+      uint8_t height = (uint8_t)((uint32_t)avg * 98 / 255);
+      if (height > 98) height = 98;
+      if (height < 1) height = 1;
+
+      uint8_t yTop = 118 - height;
+
+      for (int16_t x = 66; x <= 93; x++) {
+          display.drawVLine(x, yTop, height, COLOR_RED);
+      }
+
+      // === ВЫВОДИМ ЧИСЛОВЫЕ ЗНАЧЕНИЯ ===
+      display.clearArea(0, 10, 160, 10, COLOR_WHITE);
+      sprintf(str, "AVG:%d MIN:%d MAX:%d", avg, minVal, maxVal);
+      display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+
+      HAL_Delay(50);
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
-
 }
 
 /**
@@ -278,16 +271,16 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Supply configuration enable
+  /** Supply configuration update enable
   */
   HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+
   /** Configure the main internal regulator output voltage
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
-  __HAL_RCC_SYSCFG_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
+
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
@@ -308,6 +301,7 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+
   /** Initializes the CPU, AHB and APB buses clocks
   */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
@@ -372,6 +366,7 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 1 */
 
   /* USER CODE END ADC1_Init 1 */
+
   /** Common config
   */
   hadc1.Instance = ADC1;
@@ -389,10 +384,12 @@ static void MX_ADC1_Init(void)
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
   hadc1.Init.OversamplingMode = DISABLE;
+  hadc1.Init.Oversampling.Ratio = 1;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
     Error_Handler();
   }
+
   /** Configure the ADC multi-mode
   */
   multimode.Mode = ADC_MODE_INDEPENDENT;
@@ -400,6 +397,7 @@ static void MX_ADC1_Init(void)
   {
     Error_Handler();
   }
+
   /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_14;
@@ -436,10 +434,11 @@ static void MX_ADC2_Init(void)
   /* USER CODE BEGIN ADC2_Init 1 */
 
   /* USER CODE END ADC2_Init 1 */
+
   /** Common config
   */
   hadc2.Instance = ADC2;
-  hadc2.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV8;
+  hadc2.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV2;
   hadc2.Init.Resolution = ADC_RESOLUTION_8B;
   hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
@@ -453,10 +452,12 @@ static void MX_ADC2_Init(void)
   hadc2.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc2.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
   hadc2.Init.OversamplingMode = DISABLE;
+  hadc2.Init.Oversampling.Ratio = 1;
   if (HAL_ADC_Init(&hadc2) != HAL_OK)
   {
     Error_Handler();
   }
+
   /** Configure Regular Channel
   */
   sConfig.Channel = ADC_CHANNEL_19;
@@ -499,7 +500,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -525,6 +526,65 @@ static void MX_SPI1_Init(void)
 }
 
 /**
+  * @brief TIM3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM3_Init(void)
+{
+
+  /* USER CODE BEGIN TIM3_Init 0 */
+
+  /* USER CODE END TIM3_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM3_Init 1 */
+
+  /* USER CODE END TIM3_Init 1 */
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 65535;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM3_Init 2 */
+
+  /* USER CODE END TIM3_Init 2 */
+  HAL_TIM_MspPostInit(&htim3);
+
+}
+
+/**
   * @brief UART5 Initialization Function
   * @param None
   * @retval None
@@ -541,9 +601,9 @@ static void MX_UART5_Init(void)
   /* USER CODE END UART5_Init 1 */
   huart5.Instance = UART5;
   huart5.Init.BaudRate = 9600;
-  huart5.Init.WordLength = UART_WORDLENGTH_8B;
+  huart5.Init.WordLength = UART_WORDLENGTH_9B;
   huart5.Init.StopBits = UART_STOPBITS_1;
-  huart5.Init.Parity = UART_PARITY_NONE;
+  huart5.Init.Parity = UART_PARITY_EVEN;
   huart5.Init.Mode = UART_MODE_TX_RX;
   huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart5.Init.OverSampling = UART_OVERSAMPLING_16;
@@ -602,8 +662,8 @@ static void MX_DMA_Init(void)
 static void MX_GPIO_Init(void)
 {
   LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
-/* USER CODE BEGIN MX_GPIO_Init_1 */
-/* USER CODE END MX_GPIO_Init_1 */
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   LL_AHB4_GRP1_EnableClock(LL_AHB4_GRP1_PERIPH_GPIOE);
@@ -645,8 +705,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = LL_GPIO_AF_10;
   LL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-/* USER CODE BEGIN MX_GPIO_Init_2 */
-/* USER CODE END MX_GPIO_Init_2 */
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
@@ -667,8 +727,7 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
-#ifdef  USE_FULL_ASSERT
+#ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.
