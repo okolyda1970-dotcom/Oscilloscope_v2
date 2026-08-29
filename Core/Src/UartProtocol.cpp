@@ -200,49 +200,59 @@ bool UartProtocol::setRfOutput(bool enable)
 // === РАСЧЁТ РЕГИСТРОВ MAX2870 ===
 void UartProtocol::calculateRegisters(float freqMhz, uint32_t* reg1, uint32_t* reg2)
 {
-    // Параметры MAX2870
     const float F_PFD = 25.0;
-    uint8_t divider = 1;
+    uint16_t divider = 1;
+    uint8_t dividerCode = 0;
     uint32_t intValue = 0;
     uint16_t fracValue = 0;
 
-    // Выбор делителя
-    if (freqMhz >= 35.0 && freqMhz < 69.0) {
+    // Выбор делителя (границы по даташиту MAX2870)
+    if (freqMhz < 68.75) {
         divider = 64;
-    } else if (freqMhz >= 69.0 && freqMhz < 138.0) {
+        dividerCode = 6;  // 0b110
+    } else if (freqMhz < 137.5) {
         divider = 32;
-    } else if (freqMhz >= 138.0 && freqMhz < 275.0) {
+        dividerCode = 5;  // 0b101
+    } else if (freqMhz < 275.0) {
         divider = 16;
-    } else if (freqMhz >= 275.0 && freqMhz < 550.0) {
+        dividerCode = 4;  // 0b100
+    } else if (freqMhz < 550.0) {
         divider = 8;
-    } else if (freqMhz >= 550.0 && freqMhz < 1100.0) {
+        dividerCode = 3;  // 0b011
+    } else if (freqMhz < 1100.0) {
         divider = 4;
-    } else if (freqMhz >= 1100.0 && freqMhz < 2200.0) {
+        dividerCode = 2;  // 0b010
+    } else if (freqMhz < 2200.0) {
         divider = 2;
-    } else if (freqMhz >= 2200.0 && freqMhz <= 4400.0) {
+        dividerCode = 1;  // 0b001
+    } else {
         divider = 1;
+        dividerCode = 0;  // 0b000
     }
 
-    // Расчёт VCO частоты
+    // Расчёт VCO
     float f_vco = freqMhz * divider;
     float valueN = f_vco / F_PFD;
 
     intValue = (uint32_t)valueN;
-    fracValue = (uint16_t)((valueN - intValue) * 1000.0 + 0.5);
+    fracValue = (uint16_t)((valueN - intValue) * txRem2.modValue + 0.5);
 
-    // Формируем reg1
+    // === reg1: Формат UART-протокола ===
+    // [31:16] = INT, [15:4] = FRAC, [3:1] = MUX, [0] = reserved
     *reg1 = (intValue << 16) |
             (fracValue << 4) |
-            (0b010 << 1);
+            (0b010 << 1);  // ← БЕЗ | 1
 
-    // Формируем reg2
-    *reg2 = (txRem2.modValue << 20) |
-            (txRem2.chargePampCurrent << 16) |
-            (txRem2.outPower << 14) |
-            (txRem2.ldPinMod << 12) |
-            (divider << 9) |
-            (txRem2.attenuator1 << 8) |
-            (txRem2.attenuator2 << 7) |
-            (txRem2.attenuator3 << 6) |
-            (txRem2.reserved << 0);
+    // === reg2: Формат UART-протокола ===
+    // [31:20] = MOD, [19:16] = CP, [15:14] = PWR, [13:12] = LD,
+    // [11:9] = RF_DIV, [8] = ATT1, [7] = ATT2, [6] = ATT3, [5:0] = reserved
+    *reg2 = ((uint32_t)txRem2.modValue << 20) |
+            ((uint32_t)txRem2.chargePampCurrent << 16) |
+            ((uint32_t)txRem2.outPower << 14) |
+            ((uint32_t)txRem2.ldPinMod << 12) |
+            ((uint32_t)dividerCode << 9) |
+            ((uint32_t)txRem2.attenuator1 << 8) |
+            ((uint32_t)txRem2.attenuator2 << 7) |
+            ((uint32_t)txRem2.attenuator3 << 6) |
+            ((uint32_t)txRem2.reserved << 0);
 }
