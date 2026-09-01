@@ -34,11 +34,14 @@ public:
     volatile bool mRxComplete;
     UART_HandleTypeDef* mHuart;
 
+
     // === СТАТИЧЕСКИЕ КОЛБЭКИ ===
     static void txCompleteCallback(UART_HandleTypeDef* huart);
     static void rxCompleteCallback(UART_HandleTypeDef* huart);
     static void errorCallback(UART_HandleTypeDef* huart);
-
+    void calculateRegistersPublic(float freqMhz, uint32_t* reg1, uint32_t* reg2) {
+        calculateRegisters(freqMhz, reg1, reg2);
+    }
 private:
     // === ДАННЫЕ ДЛЯ УПРАВЛЕНИЯ ЗОНДОМ ===
     float currentFrequency;
