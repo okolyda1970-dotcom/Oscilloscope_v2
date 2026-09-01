@@ -10,6 +10,7 @@
 #define COLOR_WHITE   0xFFFF
 #define COLOR_RED     0xF800
 #define COLOR_GREEN   0x07E0
+#define COLOR_DARKGREEN 0x03E0
 #define COLOR_BLUE    0x001F
 #define COLOR_YELLOW  0xFFE0
 #define COLOR_CYAN    0x07FF
@@ -101,10 +102,12 @@ public:
     void synchronizeSignal(const uint16_t* data, uint16_t length);
     void setTriggerLevel(uint16_t level);
     void setSpan(float newSpan);
-
+    void drawVLine(uint16_t x, uint16_t y, uint16_t h, uint16_t color);
+    void drawOscillogramFast(const uint16_t* data, uint16_t length, uint16_t color, uint16_t bgColor);
     float getSpan() const;
     void setGain(float newGain);
     float getGain() const;
+    void drawScanGraph(const uint16_t* data, uint16_t length, uint16_t maxVal);
 
 private:
     uint16_t triggerLevel = 64;
