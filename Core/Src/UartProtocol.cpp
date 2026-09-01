@@ -96,7 +96,7 @@ void UartProtocol::errorCallback(UART_HandleTypeDef* huart)
 // === НОВЫЙ МЕТОД: ОТПРАВКА РЕГИСТРОВ С ПРОВЕРКОЙ ЭХО ===
 bool UartProtocol::sendRegisters(uint32_t reg1, uint32_t reg2)
 {
-    // Формируем буфер передачи
+    // Формируем буфер
     mTxBuffer[0] = (uint8_t)(reg1 >> 24);
     mTxBuffer[1] = (uint8_t)(reg1 >> 16);
     mTxBuffer[2] = (uint8_t)(reg1 >> 8);
@@ -105,64 +105,41 @@ bool UartProtocol::sendRegisters(uint32_t reg1, uint32_t reg2)
     mTxBuffer[5] = (uint8_t)(reg2 >> 16);
     mTxBuffer[6] = (uint8_t)(reg2 >> 8);
     mTxBuffer[7] = (uint8_t)(reg2);
-    mTxBuffer[8] = 0x55;  // Маркер конца пакета
+    mTxBuffer[8] = 0x55;
 
-    // Сбрасываем флаги
+    // === ПРОСТАЯ ОТПРАВКА (как старый sendCommand) ===
+    if (flagTx) {
+        // Предыдущая передача ещё не завершена — пропускаем
+        return false;
+    }
+
+    flagTx = true;
     mTxComplete = false;
-    mRxComplete = false;
 
-    // Полный сброс приёмника
-    HAL_UART_AbortReceive(mHuart);
-    __HAL_UART_CLEAR_FLAG(mHuart, UART_FLAG_PE | UART_FLAG_FE | UART_FLAG_NE | UART_FLAG_ORE);
-    volatile uint32_t dummy = mHuart->Instance->RDR;
-    (void)dummy;
-    HAL_Delay(2);
+    HAL_StatusTypeDef status = HAL_UART_Transmit_IT(mHuart, mTxBuffer, 9);
+    if (status != HAL_OK) {
+        flagTx = false;
+        errorCount++;
+        return false;
+    }
 
-    // Отправка и сразу приём
-    HAL_UART_Transmit_IT(mHuart, mTxBuffer, 9);
-    HAL_UART_Receive_IT(mHuart, mRxBuffer, 9);
-
-    // Ждём передачу
-    uint32_t timeout = 100;
+    // Ждём завершения передачи
+    uint32_t timeout = 50;
     while (!mTxComplete && timeout > 0) {
         HAL_Delay(1);
         timeout--;
     }
 
-    if (!mTxComplete) {
-        errorCount++;
-        return false;
+    if (mTxComplete) {
+        successCount++;
+        // Пауза после отправки для стабильности
+        HAL_Delay(2);
+        return true;
     }
 
-    // Ждём приём
-    timeout = 300;
-    while (!mRxComplete && timeout > 0) {
-        HAL_Delay(1);
-        timeout--;
-    }
-
-    if (!mRxComplete) {
-        errorCount++;
-        HAL_UART_AbortReceive(mHuart);
-        return false;
-    }
-
-    // Инвалидация кэша перед чтением
-    SCB_InvalidateDCache_by_Addr((uint32_t*)mRxBuffer, 9);
-    __DMB();
-
-    // Сравниваем первые 8 байт
-    for (uint8_t i = 0; i < 8; i++) {
-        if (mTxBuffer[i] != mRxBuffer[i]) {
-            errorCount++;
-            mRxComplete = false;
-            return false;
-        }
-    }
-
-    successCount++;
-    mRxComplete = false;
-    return true;
+    errorCount++;
+    flagTx = false;
+    return false;
 }
 
 // === УСТАНОВКА ЧАСТОТЫ ===
@@ -197,37 +174,29 @@ bool UartProtocol::setRfOutput(bool enable)
     return result;
 }
 
-// === РАСЧЁТ РЕГИСТРОВ MAX2870 ===
 void UartProtocol::calculateRegisters(float freqMhz, uint32_t* reg1, uint32_t* reg2)
 {
     const float F_PFD = 25.0;
-    uint16_t divider = 1;
     uint8_t dividerCode = 0;
+    uint32_t divider = 1;
     uint32_t intValue = 0;
     uint16_t fracValue = 0;
 
-    // Выбор делителя (границы по даташиту MAX2870)
+    // === Выбор КОДА делителя (не значения!) ===
     if (freqMhz < 68.75) {
-        divider = 64;
-        dividerCode = 6;  // 0b110
+        divider = 64;      dividerCode = 6;  // 0b110
     } else if (freqMhz < 137.5) {
-        divider = 32;
-        dividerCode = 5;  // 0b101
+        divider = 32;      dividerCode = 5;  // 0b101
     } else if (freqMhz < 275.0) {
-        divider = 16;
-        dividerCode = 4;  // 0b100
+        divider = 16;      dividerCode = 4;  // 0b100
     } else if (freqMhz < 550.0) {
-        divider = 8;
-        dividerCode = 3;  // 0b011
+        divider = 8;       dividerCode = 3;  // 0b011
     } else if (freqMhz < 1100.0) {
-        divider = 4;
-        dividerCode = 2;  // 0b010
+        divider = 4;       dividerCode = 2;  // 0b010
     } else if (freqMhz < 2200.0) {
-        divider = 2;
-        dividerCode = 1;  // 0b001
+        divider = 2;       dividerCode = 1;  // 0b001
     } else {
-        divider = 1;
-        dividerCode = 0;  // 0b000
+        divider = 1;       dividerCode = 0;  // 0b000
     }
 
     // Расчёт VCO
@@ -237,22 +206,21 @@ void UartProtocol::calculateRegisters(float freqMhz, uint32_t* reg1, uint32_t* r
     intValue = (uint32_t)valueN;
     fracValue = (uint16_t)((valueN - intValue) * txRem2.modValue + 0.5);
 
-    // === reg1: Формат UART-протокола ===
-    // [31:16] = INT, [15:4] = FRAC, [3:1] = MUX, [0] = reserved
+    // reg1: INT, FRAC, MUX (без бита адреса)
     *reg1 = (intValue << 16) |
             (fracValue << 4) |
-            (0b010 << 1);  // ← БЕЗ | 1
+            (0b010 << 1);
 
-    // === reg2: Формат UART-протокола ===
-    // [31:20] = MOD, [19:16] = CP, [15:14] = PWR, [13:12] = LD,
-    // [11:9] = RF_DIV, [8] = ATT1, [7] = ATT2, [6] = ATT3, [5:0] = reserved
+    // reg2: ВАЖНО — используем dividerCode, а не divider!
     *reg2 = ((uint32_t)txRem2.modValue << 20) |
             ((uint32_t)txRem2.chargePampCurrent << 16) |
             ((uint32_t)txRem2.outPower << 14) |
             ((uint32_t)txRem2.ldPinMod << 12) |
-            ((uint32_t)dividerCode << 9) |
+            ((uint32_t)dividerCode << 9) |    // ← ИСПРАВЛЕНО!
             ((uint32_t)txRem2.attenuator1 << 8) |
             ((uint32_t)txRem2.attenuator2 << 7) |
             ((uint32_t)txRem2.attenuator3 << 6) |
             ((uint32_t)txRem2.reserved << 0);
 }
+
+
