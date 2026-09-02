@@ -189,7 +189,7 @@ int main(void)
     HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
     // === ЗАПУСК НЕПРЕРЫВНОГО ЧТЕН�?Я ПОТЕНЦ�?ОМЕТРОВ ===
     adcPots.startContinuousCapture();
-    potReader.setFilterStrength(6);  // Среднее сглаживание
+    potReader.setFilterStrength(1);  // Среднее сглаживание
     HAL_Delay(10);
 
     // === НАСТРОЙКА РЕГ�?СТРОВ ===
@@ -243,37 +243,30 @@ int main(void)
         // === РЕЖИМ 2: НАСТРОЙКА ЧАСТОТЫ ===
         // ================================================================
         if (currentMode == 2) {
-            // Принудительно перезапускаем АЦП1 каждые 500 мс для надёжности
-            static uint32_t lastAdcRestartSetup = 0;
-            if (now - lastAdcRestartSetup >= 500) {
-                lastAdcRestartSetup = now;
+            // === ПРИНУДИТЕЛЬНЫЙ ПЕРЕЗАПУСК АЦП1 КАЖДЫЕ 500 МС ===
+            static uint32_t lastAdcRestart = 0;
+            if (now - lastAdcRestart >= 500) {
+                lastAdcRestart = now;
                 adcPots.startContinuousCapture();
             }
 
-            // Вычисляем текущую частоту с потенциометра
             float setupFreq = 50.0f + potReader.getCenterPercent() * 3950.0f;
+            uint16_t a1Raw = potReader.getRawValue(PotReader::CENTER);
 
-            // Обновляем отображение частоты раз в 100 мс
             static uint32_t lastSetupUpdate = 0;
-            if (now - lastSetupUpdate >= 100) {
-                lastSetupUpdate = now;
+            if (now - lastSetupUpdate >= 300) {
+                // Стираем ТОЛЬКО строку с частотой
+                display.clearArea(0, 40, 160, 12, COLOR_WHITE);
 
-                // Читаем сырые значения для диагностики
-                uint16_t a1Raw = potReader.getRawValue(PotReader::CENTER);
-
-                display.clearArea(0, 40, 160, 40, COLOR_WHITE);
-
-                // Частота (тёмно-зелёный)
+                // Рисуем частоту
                 sprintf(str, "F: %.1f MHz", setupFreq);
                 display.drawString(0, 40, str, COLOR_DARKGREEN, COLOR_WHITE);
 
-                // Значение потенциометра (для отладки)
-                sprintf(str, "A1 raw: %d", a1Raw);
-                display.drawString(0, 60, str, COLOR_BLUE, COLOR_WHITE);
+                // A1 рисуем БЕЗ стирания (пробелы в конце стирают старые цифры)
+                sprintf(str, "A1: %d   ", a1Raw);
+                display.drawString(0, 55, str, COLOR_BLUE, COLOR_WHITE);
 
-                // Процент
-                sprintf(str, "Percent: %.1f%%", potReader.getCenterPercent() * 100);
-                display.drawString(0, 70, str, COLOR_BLACK, COLOR_WHITE);
+                lastSetupUpdate = now;
             }
 
             // КНОПКА BTN3: ФИКСАЦИЯ ЧАСТОТЫ
@@ -285,9 +278,7 @@ int main(void)
                 display.clear(COLOR_WHITE);
                 sprintf(str, "SET: %.1f MHz", fixedFrequency);
                 display.drawString(0, 0, str, COLOR_DARKGREEN, COLOR_WHITE);
-                display.drawString(0, 20, "Returning to oscilloscope", COLOR_BLACK, COLOR_WHITE);
-                HAL_Delay(1000);
-
+                HAL_Delay(800);
                 currentMode = 0;
                 continue;
             }
@@ -302,10 +293,9 @@ int main(void)
                 continue;
             }
 
-            HAL_Delay(20);
+            HAL_Delay(10);
             continue;
         }
-
         // ================================================================
         // === ОБРАБОТКА КНОПОК (для режимов 0 и 1) ===
         // ================================================================
