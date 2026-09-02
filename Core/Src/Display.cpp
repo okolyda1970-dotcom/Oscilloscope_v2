@@ -197,33 +197,39 @@ void Display::drawOscillogram(const uint16_t* data, uint16_t length,
 
 void Display::clearArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
 {
+    if (w == 0 || h == 0) return;
+
     setAddressWindow(x, y, x + w - 1, y + h - 1);
 
-    // === ПАКЕТНАЯ ОТПРАВКА (быстрее в 10-20 раз) ===
     uint8_t hi = color >> 8;
     uint8_t lo = color & 0xFF;
 
-    // Буфер для пакетной отправки (32 байта = 16 пикселей)
-    uint8_t buffer[64];
-    for (uint16_t i = 0; i < 32; i++) {
-        buffer[i * 2]     = hi;
-        buffer[i * 2 + 1] = lo;
+    // === НЕБОЛЬШОЙ БУФЕР НА СТЕКЕ (безопасно для polling SPI) ===
+    uint8_t buffer[128];  // 64 пикселя за раз
+    for (uint16_t i = 0; i < sizeof(buffer); i += 2) {
+        buffer[i]     = hi;
+        buffer[i + 1] = lo;
     }
 
-    // Количество итераций для всей области
-    uint32_t totalPixels = w * h;
+    uint32_t totalPixels = (uint32_t)w * h;
 
-    HAL_GPIO_WritePin(mDcPort, mDcPin, GPIO_PIN_SET);  // Режим данных
+    // === УСТАНОВКА CS/DC ===
+    HAL_GPIO_WritePin(mDcPort, mDcPin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(mCsPort, mCsPin, GPIO_PIN_RESET);
 
-    while (totalPixels >= 32) {
-        HAL_SPI_Transmit(mHspi, buffer, 64, HAL_MAX_DELAY);
-        totalPixels -= 32;
+    // Пакетная отправка через polling SPI (без DMA, надёжно)
+    while (totalPixels >= 64) {
+        HAL_SPI_Transmit(mHspi, buffer, sizeof(buffer), HAL_MAX_DELAY);
+        totalPixels -= 64;
     }
 
-    // Остаток
+    // Остаток — отправляем по одному пикселю
     if (totalPixels > 0) {
-        HAL_SPI_Transmit(mHspi, buffer, totalPixels * 2, HAL_MAX_DELAY);
+        uint8_t pixel[2] = {hi, lo};
+        while (totalPixels > 0) {
+            HAL_SPI_Transmit(mHspi, pixel, 2, HAL_MAX_DELAY);
+            totalPixels--;
+        }
     }
 
     HAL_GPIO_WritePin(mCsPort, mCsPin, GPIO_PIN_SET);
