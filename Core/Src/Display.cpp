@@ -197,17 +197,36 @@ void Display::drawOscillogram(const uint16_t* data, uint16_t length,
 
 void Display::clearArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
 {
-    select();
     setAddressWindow(x, y, x + w - 1, y + h - 1);
 
-    uint8_t data[2] = { (uint8_t)(color >> 8), (uint8_t)(color & 0xFF) };
-    HAL_GPIO_WritePin(mDcPort, mDcPin, GPIO_PIN_SET);
+    // === ПАКЕТНАЯ ОТПРАВКА (быстрее в 10-20 раз) ===
+    uint8_t hi = color >> 8;
+    uint8_t lo = color & 0xFF;
 
-    for (uint16_t i = 0; i < w * h; i++) {
-        HAL_SPI_Transmit(mHspi, data, 2, HAL_MAX_DELAY);
+    // Буфер для пакетной отправки (32 байта = 16 пикселей)
+    uint8_t buffer[64];
+    for (uint16_t i = 0; i < 32; i++) {
+        buffer[i * 2]     = hi;
+        buffer[i * 2 + 1] = lo;
     }
 
-    unselect();
+    // Количество итераций для всей области
+    uint32_t totalPixels = w * h;
+
+    HAL_GPIO_WritePin(mDcPort, mDcPin, GPIO_PIN_SET);  // Режим данных
+    HAL_GPIO_WritePin(mCsPort, mCsPin, GPIO_PIN_RESET);
+
+    while (totalPixels >= 32) {
+        HAL_SPI_Transmit(mHspi, buffer, 64, HAL_MAX_DELAY);
+        totalPixels -= 32;
+    }
+
+    // Остаток
+    if (totalPixels > 0) {
+        HAL_SPI_Transmit(mHspi, buffer, totalPixels * 2, HAL_MAX_DELAY);
+    }
+
+    HAL_GPIO_WritePin(mCsPort, mCsPin, GPIO_PIN_SET);
 }
 
 void Display::drawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2,
@@ -289,3 +308,136 @@ void Display::drawString(uint16_t x, uint16_t y, const char* str,
 
     unselect();
 }
+
+void Display::drawVLine(uint16_t x, uint16_t y, uint16_t h, uint16_t color)
+{
+    if (x >= mWidth || y >= mHeight) return;
+    if (y + h > mHeight) h = mHeight - y;
+    if (h == 0) return;
+
+    select();
+    setAddressWindow(x, y, x, y + h - 1);
+
+    uint8_t data[2] = { (uint8_t)(color >> 8), (uint8_t)(color & 0xFF) };
+    HAL_GPIO_WritePin(mDcPort, mDcPin, GPIO_PIN_SET);
+    for (uint16_t i = 0; i < h; i++) {
+        HAL_SPI_Transmit(mHspi, data, 2, HAL_MAX_DELAY);
+    }
+    unselect();  // ← ОБЯЗАТЕЛЬНО В КОНЦЕ!
+}
+
+// === БЫСТРАЯ ОТРИСОВКА ОСЦИЛЛОГРАММЫ (только область графика) ===
+void Display::drawOscillogramFast(const uint16_t* data, uint16_t length,
+                                  uint16_t color, uint16_t bgColor)
+{
+    if (data == nullptr || length == 0) return;
+
+    const uint16_t graphTop = 50;
+    const uint16_t graphHeight = ST7735_HEIGHT - graphTop;
+
+    static uint16_t frameBuffer[ST7735_WIDTH * graphHeight];
+
+    // Заполняем буфер фоновым цветом
+    for (uint16_t i = 0; i < ST7735_WIDTH * graphHeight; i++) {
+        frameBuffer[i] = bgColor;
+    }
+
+    // Вычисляем среднее для центровки
+    uint32_t sum = 0;
+    for (uint16_t i = 0; i < length; i++) {
+        sum += data[i];
+    }
+    uint16_t avg = sum / length;
+
+    // === РИСУЕМ ЛИНИЮ, СОЕДИНЯЯ СОСЕДНИЕ ТОЧКИ ===
+    int16_t prevY = -1;
+
+    for (uint16_t x = 0; x < ST7735_WIDTH; x++) {
+        uint16_t idx = (x * length) / ST7735_WIDTH;
+        uint16_t value = data[idx];
+
+        int16_t centered = (int16_t)value - (int16_t)avg;
+        float scaled = centered * gain;
+
+        int16_t y = (int16_t)(graphHeight / 2) - (int16_t)scaled;
+
+        if (y < 0) y = 0;
+        if (y >= graphHeight) y = graphHeight - 1;
+
+        // === СОЕДИНЯЕМ С ПРЕДЫДУЩЕЙ ТОЧКОЙ ===
+        if (prevY >= 0) {
+            // Рисуем вертикальную линию от предыдущей точки к текущей
+            int16_t yStart = (prevY < y) ? prevY : y;
+            int16_t yEnd = (prevY > y) ? prevY : y;
+
+            for (int16_t yy = yStart; yy <= yEnd; yy++) {
+                frameBuffer[yy * ST7735_WIDTH + x] = color;
+                // Толщина 2 пикселя
+                if (x + 1 < ST7735_WIDTH) {
+                    frameBuffer[yy * ST7735_WIDTH + x + 1] = color;
+                }
+            }
+        } else {
+            // Первая точка
+            frameBuffer[y * ST7735_WIDTH + x] = color;
+            if (x + 1 < ST7735_WIDTH) {
+                frameBuffer[y * ST7735_WIDTH + x + 1] = color;
+            }
+        }
+
+        prevY = y;
+    }
+
+    // Отправляем буфер
+    select();
+    setAddressWindow(0, graphTop, ST7735_WIDTH - 1, ST7735_HEIGHT - 1);
+    HAL_GPIO_WritePin(mDcPort, mDcPin, GPIO_PIN_SET);
+    HAL_SPI_Transmit(mHspi, (uint8_t*)frameBuffer,
+                     ST7735_WIDTH * graphHeight * 2, HAL_MAX_DELAY);
+    unselect();
+}
+
+void Display::drawScanGraph(const uint16_t* data, uint16_t length, uint16_t maxVal)
+{
+    if (data == nullptr || length == 0) return;
+
+    const uint16_t graphTop = 40;
+    const uint16_t graphHeight = ST7735_HEIGHT - graphTop;
+
+    static uint16_t frameBuffer[ST7735_WIDTH * graphHeight];
+
+    // Заполняем буфер белым
+    for (uint16_t i = 0; i < ST7735_WIDTH * graphHeight; i++) {
+        frameBuffer[i] = COLOR_WHITE;
+    }
+
+    // Рисуем столбики с масштабированием (length точек → 160 пикселей)
+    for (uint16_t x = 0; x < ST7735_WIDTH; x++) {
+        // Масштабируем: 160 пикселей → length точек
+        uint16_t idx = (x * length) / ST7735_WIDTH;
+        if (idx >= length) idx = length - 1;
+
+        uint16_t value = data[idx];
+
+        uint16_t height = 0;
+        if (maxVal > 0) {
+            height = (uint32_t)value * (graphHeight - 2) / maxVal / 2;  // Амплитуда в 2 раза меньше
+        }
+        if (height > graphHeight - 2) height = graphHeight - 2;
+
+        // Столбик снизу вверх
+        for (uint16_t y = 0; y < height; y++) {
+            uint16_t pixelY = graphHeight - 1 - y;
+            frameBuffer[pixelY * ST7735_WIDTH + x] = COLOR_RED;
+        }
+    }
+
+    // Отправляем буфер
+    select();
+    setAddressWindow(0, graphTop, ST7735_WIDTH - 1, ST7735_HEIGHT - 1);
+    HAL_GPIO_WritePin(mDcPort, mDcPin, GPIO_PIN_SET);
+    HAL_SPI_Transmit(mHspi, (uint8_t*)frameBuffer,
+                     ST7735_WIDTH * graphHeight * 2, HAL_MAX_DELAY);
+    unselect();
+}
+
