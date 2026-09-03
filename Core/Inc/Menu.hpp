@@ -105,13 +105,28 @@ private:
     uint32_t mBtn3PressTime;
     bool mBtn3Pressed;
 
+    // Оптимизация рендера
+    bool mNeedRedraw;
+    uint8_t mLastSelectedItem;
+    State mLastState;
+
+    // === РЕЗЕРВНЫЕ КОПИИ ДЛЯ ОТКАТА ===
+    float mBackupFrequency;
+    uint8_t mBackupOffset;
+    bool mBackupAtt1;
+    bool mBackupAtt2;
+    uint8_t mBackupTimebase;
+    uint16_t mBackupTrigger;
+    float mBackupScanCenter;
+    float mBackupScanSpan;
+
     // Внутренние методы
     void renderMain();
     void renderSettings();
     void renderEdit();
     void handleMain();
     void handleSettings();
-    void handleEdit();
+    bool handleEdit();
     void adjustValue(int8_t delta);
 };
 
