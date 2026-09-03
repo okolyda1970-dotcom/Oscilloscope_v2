@@ -12,7 +12,12 @@ Menu::Menu(Display* display, ButtonManager* buttons)
       mAtt1Changed(false), mAtt2Changed(false),
       mTimebaseChanged(false), mTriggerChanged(false),
       mScanCenterChanged(false), mScanSpanChanged(false),
-      mBtn3PressTime(0), mBtn3Pressed(false)
+      mBtn3PressTime(0), mBtn3Pressed(false),
+      mNeedRedraw(true), mLastSelectedItem(0), mLastState(STATE_HIDDEN),
+      mBackupFrequency(900.0f), mBackupOffset(128),
+      mBackupAtt1(false), mBackupAtt2(false),
+      mBackupTimebase(0), mBackupTrigger(2048),
+      mBackupScanCenter(900.0f), mBackupScanSpan(320.0f)
 {
 }
 
@@ -20,31 +25,70 @@ void Menu::update(uint8_t currentMode)
 {
     mCurrentMode = currentMode;
 
-    // === ОТКРЫТИЕ МЕНЮ ПО КОРОТКОМУ НАЖАТИЮ BTN3 ===
+    // === ЕСЛИ МЕНЮ СКРЫТО: ждём нажатие кнопки 3 для открытия ===
     if (mState == STATE_HIDDEN) {
         ButtonManager::ButtonEvent evt3 = mButtons->getEvent(ButtonManager::BTN3);
-        if (evt3 == ButtonManager::PRESSED) {
+        if (evt3 == ButtonManager::PRESSED || evt3 == ButtonManager::LONG_PRESS) {
+            mButtons->getEvent(ButtonManager::BTN1);
+            mButtons->getEvent(ButtonManager::BTN2);
+            mButtons->getEvent(ButtonManager::BTN4);
             show();
         }
-        return;  // Меню скрыто — дальше не обрабатываем
+        return;
     }
 
-    // === ОБРАБОТКА СОСТОЯНИЙ МЕНЮ ===
+    // === ОТЛАЖИВАЕМ ИЗМЕНЕНИЯ ДЛЯ РЕНДЕРА ===
+    bool stateChanged = (mState != mLastState);
+    bool selectionChanged = (mSelectedItem != mLastSelectedItem);
+
+    if (stateChanged || selectionChanged) {
+        mNeedRedraw = true;
+        mLastState = mState;
+        mLastSelectedItem = mSelectedItem;
+    }
+
+    // === ПРИНУДИТЕЛЬНЫЙ СБРОС ПРИ СМЕНЕ СОСТОЯНИЯ ===
+    if (stateChanged) {
+        mDisplay->clearArea(0, 0, 160, 128, COLOR_WHITE);
+    }
+
+    // === ОБРАБОТКА СОСТОЯНИЙ ===
+    bool valueChanged = false;
+
     switch (mState) {
         case STATE_MAIN:
             handleMain();
-            renderMain();
             break;
         case STATE_SETTINGS:
             handleSettings();
-            renderSettings();
             break;
         case STATE_EDIT:
-            handleEdit();
-            renderEdit();
+            valueChanged = handleEdit();
             break;
         default:
             break;
+    }
+
+    if (valueChanged) {
+        mNeedRedraw = true;
+    }
+
+    // === РЕНДЕР ТОЛЬКО ПРИ ИЗМЕНЕНИЯХ ===
+    if (mNeedRedraw) {
+        switch (mState) {
+            case STATE_MAIN:
+                renderMain();
+                break;
+            case STATE_SETTINGS:
+                renderSettings();
+                break;
+            case STATE_EDIT:
+                renderEdit();
+                break;
+            default:
+                break;
+        }
+        mNeedRedraw = false;
     }
 }
 
@@ -52,13 +96,17 @@ void Menu::show()
 {
     mState = STATE_MAIN;
     mSelectedItem = 0;
-    mDisplay->clear(COLOR_WHITE);
+    mNeedRedraw = true;
+    mLastState = STATE_HIDDEN;
+    mLastSelectedItem = 255;
+    mDisplay->clearArea(0, 0, 160, 128, COLOR_WHITE);
 }
 
 void Menu::hide()
 {
     mState = STATE_HIDDEN;
-    mDisplay->clear(COLOR_WHITE);
+    mNeedRedraw = true;
+    mDisplay->clearArea(0, 0, 160, 128, COLOR_WHITE);
 }
 
 bool Menu::isVisible() const
@@ -71,8 +119,11 @@ void Menu::renderMain()
 {
     const char* items[] = {"Oscilloscope", "Scanner", "Settings"};
 
-    mDisplay->clear(COLOR_WHITE);
+    // Стираем ВЕСЬ экран (надёжно, без наложений)
+    mDisplay->clearArea(0, 0, 160, 128, COLOR_WHITE);
+
     mDisplay->drawString(0, 0, "MAIN MENU", COLOR_BLACK, COLOR_WHITE);
+    mDisplay->drawString(0, 10, "------------------", COLOR_BLACK, COLOR_WHITE);
 
     for (uint8_t i = 0; i < 3; i++) {
         uint16_t color = (i == mSelectedItem) ? COLOR_BLUE : COLOR_BLACK;
@@ -80,9 +131,13 @@ void Menu::renderMain()
 
         if (i == mSelectedItem) {
             mDisplay->drawString(0, y, ">", COLOR_RED, COLOR_WHITE);
+        } else {
+            mDisplay->drawString(0, y, " ", COLOR_BLACK, COLOR_WHITE);
         }
         mDisplay->drawString(10, y, items[i], color, COLOR_WHITE);
     }
+
+    mDisplay->drawString(0, 75, "BTN4:OK BTN3:Back", COLOR_BLACK, COLOR_WHITE);
 }
 
 void Menu::handleMain()
@@ -92,15 +147,20 @@ void Menu::handleMain()
     ButtonManager::ButtonEvent evt3 = mButtons->getEvent(ButtonManager::BTN3);
     ButtonManager::ButtonEvent evt4 = mButtons->getEvent(ButtonManager::BTN4);
 
+    // BTN1 = ВВЕРХ
     if (evt1 == ButtonManager::PRESSED) {
+        mSelectedItem = (mSelectedItem + 2) % 3;
+    }
+    // BTN2 = ВНИЗ
+    if (evt2 == ButtonManager::PRESSED) {
         mSelectedItem = (mSelectedItem + 1) % 3;
     }
-    if (evt2 == ButtonManager::PRESSED) {
-        mSelectedItem = (mSelectedItem + 2) % 3;  // -1 mod 3
-    }
-    if (evt3 == ButtonManager::PRESSED) {
+    // BTN3 = НАЗАД (выход из меню)
+    if (evt3 == ButtonManager::PRESSED || evt3 == ButtonManager::LONG_PRESS) {
         hide();
+        return;
     }
+    // BTN4 = ВЫБРАТЬ
     if (evt4 == ButtonManager::PRESSED) {
         if (mSelectedItem == 0) {
             mCurrentMode = MODE_OSCILLOSCOPE;
@@ -118,25 +178,28 @@ void Menu::handleMain()
 // === НАСТРОЙКИ ===
 void Menu::renderSettings()
 {
-    mDisplay->clear(COLOR_WHITE);
+    // Стираем ВЕСЬ экран (надёжно, без наложений)
+    mDisplay->clearArea(0, 0, 160, 128, COLOR_WHITE);
+
     mDisplay->drawString(0, 0, "SETTINGS", COLOR_BLACK, COLOR_WHITE);
+    mDisplay->drawString(0, 10, "------------------", COLOR_BLACK, COLOR_WHITE);
 
     uint8_t paramCount = 0;
-    char items[10][20];
+    const char* items[10];
 
     if (mCurrentMode == MODE_OSCILLOSCOPE) {
         paramCount = OSC_PARAM_COUNT;
-        strcpy(items[0], "Frequency");
-        strcpy(items[1], "Offset");
-        strcpy(items[2], "Attenuator 1");
-        strcpy(items[3], "Attenuator 2");
-        strcpy(items[4], "Timebase");
-        strcpy(items[5], "Trigger");
+        items[0] = "Frequency";
+        items[1] = "Offset";
+        items[2] = "Attenuator 1";
+        items[3] = "Attenuator 2";
+        items[4] = "Timebase";
+        items[5] = "Trigger";
     } else {
         paramCount = SCAN_PARAM_COUNT;
-        strcpy(items[0], "Center");
-        strcpy(items[1], "Span");
-        strcpy(items[2], "Offset");
+        items[0] = "Center";
+        items[1] = "Span";
+        items[2] = "Offset";
     }
 
     for (uint8_t i = 0; i < paramCount; i++) {
@@ -145,9 +208,13 @@ void Menu::renderSettings()
 
         if (i == mSelectedItem) {
             mDisplay->drawString(0, y, ">", COLOR_RED, COLOR_WHITE);
+        } else {
+            mDisplay->drawString(0, y, " ", COLOR_BLACK, COLOR_WHITE);
         }
         mDisplay->drawString(10, y, items[i], color, COLOR_WHITE);
     }
+
+    mDisplay->drawString(0, 100, "BTN4:Edit BTN3:Back", COLOR_BLACK, COLOR_WHITE);
 }
 
 void Menu::handleSettings()
@@ -160,17 +227,32 @@ void Menu::handleSettings()
     ButtonManager::ButtonEvent evt3 = mButtons->getEvent(ButtonManager::BTN3);
     ButtonManager::ButtonEvent evt4 = mButtons->getEvent(ButtonManager::BTN4);
 
+    // BTN1 = ВВЕРХ
     if (evt1 == ButtonManager::PRESSED) {
-        mSelectedItem = (mSelectedItem + 1) % paramCount;
-    }
-    if (evt2 == ButtonManager::PRESSED) {
         mSelectedItem = (mSelectedItem + paramCount - 1) % paramCount;
     }
-    if (evt3 == ButtonManager::PRESSED) {
+    // BTN2 = ВНИЗ
+    if (evt2 == ButtonManager::PRESSED) {
+        mSelectedItem = (mSelectedItem + 1) % paramCount;
+    }
+    // BTN3 = НАЗАД
+    if (evt3 == ButtonManager::PRESSED || evt3 == ButtonManager::LONG_PRESS) {
         mState = STATE_MAIN;
         mSelectedItem = 0;
+        return;
     }
+    // BTN4 = РЕДАКТИРОВАТЬ
     if (evt4 == ButtonManager::PRESSED) {
+        // === СОХРАНЯЕМ ТЕКУЩИЕ ЗНАЧЕНИЯ ДЛЯ ОТКАТА ===
+        mBackupFrequency = mFrequency;
+        mBackupOffset = mOffset;
+        mBackupAtt1 = mAtt1;
+        mBackupAtt2 = mAtt2;
+        mBackupTimebase = mTimebase;
+        mBackupTrigger = mTrigger;
+        mBackupScanCenter = mScanCenter;
+        mBackupScanSpan = mScanSpan;
+
         mState = STATE_EDIT;
     }
 }
@@ -178,76 +260,119 @@ void Menu::handleSettings()
 // === РЕДАКТИРОВАНИЕ ===
 void Menu::renderEdit()
 {
-    mDisplay->clear(COLOR_WHITE);
-
-    char title[20];
+    const char* title = "";
     char value[32];
+    value[0] = '\0';
 
     if (mCurrentMode == MODE_OSCILLOSCOPE) {
         switch (mSelectedItem) {
             case OSC_FREQ:
-                strcpy(title, "Frequency");
+                title = "Frequency";
                 sprintf(value, "%.1f MHz", mFrequency);
                 break;
             case OSC_OFFSET:
-                strcpy(title, "Offset");
+                title = "Offset";
                 sprintf(value, "%d", mOffset);
                 break;
             case OSC_ATT1:
-                strcpy(title, "Attenuator 1");
-                strcpy(value, mAtt1 ? "ON" : "OFF");
+                title = "Attenuator 1";
+                sprintf(value, "%s", mAtt1 ? "ON" : "OFF");
                 break;
             case OSC_ATT2:
-                strcpy(title, "Attenuator 2");
-                strcpy(value, mAtt2 ? "ON" : "OFF");
+                title = "Attenuator 2";
+                sprintf(value, "%s", mAtt2 ? "ON" : "OFF");
                 break;
             case OSC_TIMEBASE:
-                strcpy(title, "Timebase");
+                title = "Timebase";
                 sprintf(value, "%dx", 1 << mTimebase);
                 break;
             case OSC_TRIGGER:
-                strcpy(title, "Trigger");
+                title = "Trigger";
                 sprintf(value, "%d", mTrigger);
+                break;
+            default:
+                title = "?";
                 break;
         }
     } else {
         switch (mSelectedItem) {
             case SCAN_CENTER:
-                strcpy(title, "Center");
+                title = "Center";
                 sprintf(value, "%.1f MHz", mScanCenter);
                 break;
             case SCAN_SPAN:
-                strcpy(title, "Span");
+                title = "Span";
                 sprintf(value, "%.0f MHz", mScanSpan);
                 break;
             case SCAN_OFFSET:
-                strcpy(title, "Offset");
+                title = "Offset";
                 sprintf(value, "%d", mOffset);
+                break;
+            default:
+                title = "?";
                 break;
         }
     }
 
+    // Стираем ВЕСЬ экран (надёжно, без наложений)
+    mDisplay->clearArea(0, 0, 160, 128, COLOR_WHITE);
+
     mDisplay->drawString(0, 0, title, COLOR_BLACK, COLOR_WHITE);
-    mDisplay->drawString(0, 30, value, COLOR_GREEN, COLOR_WHITE);
-    mDisplay->drawString(0, 50, "BTN1:+ BTN2:-", COLOR_BLACK, COLOR_WHITE);
-    mDisplay->drawString(0, 60, "BTN3:Back BTN4:OK", COLOR_BLACK, COLOR_WHITE);
+    mDisplay->drawString(0, 10, "------------------", COLOR_BLACK, COLOR_WHITE);
+
+    // Значение крупно
+    mDisplay->drawString(0, 30, value, COLOR_BLUE, COLOR_WHITE);
+
+    // Подсказки
+    mDisplay->drawString(0, 55, "BTN1:- BTN2:+", COLOR_BLACK, COLOR_WHITE);
+    mDisplay->drawString(0, 65, "BTN4:OK BTN3:Cancel", COLOR_BLACK, COLOR_WHITE);
 }
 
-void Menu::handleEdit()
+bool Menu::handleEdit()
 {
     ButtonManager::ButtonEvent evt1 = mButtons->getEvent(ButtonManager::BTN1);
     ButtonManager::ButtonEvent evt2 = mButtons->getEvent(ButtonManager::BTN2);
     ButtonManager::ButtonEvent evt3 = mButtons->getEvent(ButtonManager::BTN3);
     ButtonManager::ButtonEvent evt4 = mButtons->getEvent(ButtonManager::BTN4);
 
-    if (evt1 == ButtonManager::PRESSED) adjustValue(1);
-    if (evt2 == ButtonManager::PRESSED) adjustValue(-1);
-    if (evt3 == ButtonManager::PRESSED) {
-        mState = STATE_SETTINGS;
+    bool changed = false;
+
+    // BTN1 = МИНУС
+    if (evt1 == ButtonManager::PRESSED) {
+        adjustValue(-1);
+        changed = true;
     }
+    // BTN2 = ПЛЮС
+    if (evt2 == ButtonManager::PRESSED) {
+        adjustValue(1);
+        changed = true;
+    }
+    // BTN3 = НАЗАД (ОТКАТ БЕЗ СОХРАНЕНИЯ)
+    if (evt3 == ButtonManager::PRESSED || evt3 == ButtonManager::LONG_PRESS) {
+        // === ВОССТАНАВЛИВАЕМ ЗНАЧЕНИЯ ===
+        mFrequency = mBackupFrequency;
+        mOffset = mBackupOffset;
+        mAtt1 = mBackupAtt1;
+        mAtt2 = mBackupAtt2;
+        mTimebase = mBackupTimebase;
+        mTrigger = mBackupTrigger;
+        mScanCenter = mBackupScanCenter;
+        mScanSpan = mBackupScanSpan;
+
+        // === СБРАСЫВАЕМ ФЛАГИ ИЗМЕНЕНИЙ ===
+        resetFlags();
+
+        mState = STATE_SETTINGS;
+        return false;
+    }
+    // BTN4 = ПРИМЕНИТЬ (СОХРАНИТЬ)
     if (evt4 == ButtonManager::PRESSED) {
+        // Значения уже изменены — просто выходим
         mState = STATE_SETTINGS;
+        return false;
     }
+
+    return changed;
 }
 
 void Menu::adjustValue(int8_t delta)
@@ -261,8 +386,8 @@ void Menu::adjustValue(int8_t delta)
                 mFreqChanged = true;
                 break;
             case OSC_OFFSET:
-                mOffset += delta;
-                if (mOffset > 255) mOffset = 0;
+                if (delta > 0 && mOffset < 255) mOffset++;
+                else if (delta < 0 && mOffset > 0) mOffset--;
                 mOffsetChanged = true;
                 break;
             case OSC_ATT1:
@@ -274,8 +399,8 @@ void Menu::adjustValue(int8_t delta)
                 mAtt2Changed = true;
                 break;
             case OSC_TIMEBASE:
-                mTimebase += delta;
-                if (mTimebase > 3) mTimebase = 0;
+                if (delta > 0 && mTimebase < 3) mTimebase++;
+                else if (delta < 0 && mTimebase > 0) mTimebase--;
                 mTimebaseChanged = true;
                 break;
             case OSC_TRIGGER:
@@ -299,8 +424,8 @@ void Menu::adjustValue(int8_t delta)
                 mScanSpanChanged = true;
                 break;
             case SCAN_OFFSET:
-                mOffset += delta;
-                if (mOffset > 255) mOffset = 0;
+                if (delta > 0 && mOffset < 255) mOffset++;
+                else if (delta < 0 && mOffset > 0) mOffset--;
                 mOffsetChanged = true;
                 break;
         }
