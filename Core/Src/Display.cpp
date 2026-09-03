@@ -199,12 +199,15 @@ void Display::clearArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t
 {
     if (w == 0 || h == 0) return;
 
+    // === ВАЖНО: select() ДОЛЖЕН быть ДО setAddressWindow() ===
+    select();
+
     setAddressWindow(x, y, x + w - 1, y + h - 1);
 
     uint8_t hi = color >> 8;
     uint8_t lo = color & 0xFF;
 
-    // === НЕБОЛЬШОЙ БУФЕР НА СТЕКЕ (безопасно для polling SPI) ===
+    // Буфер на стеке
     uint8_t buffer[128];  // 64 пикселя за раз
     for (uint16_t i = 0; i < sizeof(buffer); i += 2) {
         buffer[i]     = hi;
@@ -213,17 +216,16 @@ void Display::clearArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t
 
     uint32_t totalPixels = (uint32_t)w * h;
 
-    // === УСТАНОВКА CS/DC ===
+    // DC = DATA (уже установлено в setAddressWindow, но на всякий случай)
     HAL_GPIO_WritePin(mDcPort, mDcPin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(mCsPort, mCsPin, GPIO_PIN_RESET);
 
-    // Пакетная отправка через polling SPI (без DMA, надёжно)
+    // Пакетная отправка
     while (totalPixels >= 64) {
         HAL_SPI_Transmit(mHspi, buffer, sizeof(buffer), HAL_MAX_DELAY);
         totalPixels -= 64;
     }
 
-    // Остаток — отправляем по одному пикселю
+    // Остаток
     if (totalPixels > 0) {
         uint8_t pixel[2] = {hi, lo};
         while (totalPixels > 0) {
@@ -232,7 +234,8 @@ void Display::clearArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t
         }
     }
 
-    HAL_GPIO_WritePin(mCsPort, mCsPin, GPIO_PIN_SET);
+    // === ВАЖНО: unselect() В КОНЦЕ ===
+    unselect();
 }
 
 void Display::drawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2,
