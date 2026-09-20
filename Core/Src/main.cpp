@@ -2,17 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * @brief          : Main program body — Простой осциллограф
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -21,7 +11,18 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "AdcDma.hpp"
+#include "Display.hpp"
+#include "UartProtocol.hpp"
+#include "Registers.hpp"
+#include "st7735.h"
+#include <cstdio>
+#include <string.h>
+#include "ButtonManager.hpp"
+#include "Scanner.hpp"
+#include "Oscilloscope.hpp"
+#include "PotReader.hpp"
+#include "Menu.hpp"              // ← ДОБАВЬТЕ ЭТУ СТРОКУ
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define PI 3.14159265358979323846
+#define ADC_BUFFER_SIZE 160
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,6 +48,7 @@ DMA_HandleTypeDef hdma_adc1;
 DMA_HandleTypeDef hdma_adc2;
 
 SPI_HandleTypeDef hspi1;
+DMA_HandleTypeDef hdma_spi1_tx;
 
 TIM_HandleTypeDef htim3;
 
@@ -54,6 +57,30 @@ DMA_HandleTypeDef hdma_uart5_rx;
 
 /* USER CODE BEGIN PV */
 
+// === БУФЕРЫ АЦП ===
+uint16_t adcBuffer[ADC_BUFFER_SIZE];   // Буфер детектора сигнала
+uint16_t potBuffer[2];                  // Буфер потенциометров (A0, A1)
+
+// === ОБЪЕКТЫ АЦП (создаются ДО остальных объектов!) ===
+AdcDma adcDetector(&hadc2, &hdma_adc2, adcBuffer, ADC_BUFFER_SIZE);
+AdcDma adcPots(&hadc1, &hdma_adc1, potBuffer, 2);
+// === ОБЪЕКТЫ ===
+UartProtocol uart(&huart5);
+Display display(&hspi1, GPIOB, GPIO_PIN_8, GPIOB, GPIO_PIN_6, GPIOB, GPIO_PIN_7);
+
+// === МЕНЕДЖЕР КНОПОК (исправленный порядок) ===
+ButtonManager buttons(BUTTON_2_GPIO_Port, BUTTON_2_Pin,   // BTN1 (физически кнопка 2)
+                      BUTTON_1_GPIO_Port, BUTTON_1_Pin,   // BTN2 (физически кнопка 1)
+                      BUTTON_4_GPIO_Port, BUTTON_4_Pin,   // BTN3 (физически кнопка 4)
+                      BUTTON_3_GPIO_Port, BUTTON_3_Pin);  // BTN4 (физически кнопка 3)
+Scanner scanner(&uart, &hadc2, adcBuffer, ADC_BUFFER_SIZE);
+Oscilloscope oscilloscope(&adcDetector);
+PotReader potReader(&adcPots);
+Menu menu(&display, &buttons);
+// === ФЛАГ�? ===
+volatile uint8_t flagAdc = 0;
+uint8_t currentMode = 0;
+float fixedFrequency = 900.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,11 +94,50 @@ static void MX_SPI1_Init(void);
 static void MX_UART5_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
+void setOffset(uint8_t value);
 
+void setOffset(uint8_t value);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// === КОЛБЭК�? UART ===
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == UART5) {
+        HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);  // ← Мигание при передаче
+        UartProtocol::txCompleteCallback(huart);
+    }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == UART5) {
+        HAL_GPIO_TogglePin(LED_1_GPIO_Port, LED_1_Pin);  // ← Мигание при приёме
+        UartProtocol::rxCompleteCallback(huart);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == UART5) {
+        __HAL_UART_CLEAR_FLAG(huart, UART_FLAG_PE | UART_FLAG_FE |
+                              UART_FLAG_NE | UART_FLAG_ORE);
+        UartProtocol::errorCallback(huart);
+    }
+}
+
+// === КОЛБЭК АЦП ===
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+	// ПРАВ�?ЛЬНО:
+	AdcDma::convCpltCallback(hadc);
+}
+
+// === УСТАНОВКА УРОВНЯ СМЕЩЕН�?Я ОУ ===
+void setOffset(uint8_t value) {
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, value);
+}
 
 /* USER CODE END 0 */
 
@@ -81,7 +147,6 @@ static void MX_TIM3_Init(void);
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
@@ -98,7 +163,7 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
-  /* Configure the peripherals common clocks */
+/* Configure the peripherals common clocks */
   PeriphCommonClock_Config();
 
   /* USER CODE BEGIN SysInit */
@@ -114,17 +179,313 @@ int main(void)
   MX_UART5_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+    HAL_Delay(500);
+    display.init();
+    display.clear(COLOR_WHITE);
 
+    // === ЗАПУСК Ш�?М ДЛЯ СМЕЩЕН�?Я ОУ ===
+    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+    setOffset(128);
+
+    // === КАЛ�?БРОВКА АЦП ===
+    HAL_ADCEx_Calibration_Start(&hadc2, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
+    // === ЗАПУСК НЕПРЕРЫВНОГО ЧТЕН�?Я ПОТЕНЦ�?ОМЕТРОВ ===
+    adcPots.startContinuousCapture();
+    potReader.setFilterStrength(1);  // Среднее сглаживание
+    HAL_Delay(10);
+
+    // === НАСТРОЙКА РЕГ�?СТРОВ ===
+    setDefaultRegisters();
+
+    // === ДАЁМ ЗОНДУ ВРЕМЯ ПРОСНУТЬСЯ ===
+    display.drawString(0, 0, "Probe waking up...", COLOR_BLACK, COLOR_WHITE);
+    HAL_Delay(1000);
+
+    // === УСТАНОВКА НАЧАЛЬНОЙ ЧАСТОТЫ ===
+    uart.setFrequency(900.0);
+    uart.setRfOutput(true);
+
+    // === ГОТОВО ===
+    display.clear(COLOR_WHITE);
+    display.drawString(0, 0, "INIT COMPLETE", COLOR_GREEN, COLOR_WHITE);
+    display.drawString(0, 10, "F: 900MHz", COLOR_BLACK, COLOR_WHITE);
+    display.drawString(0, 20, "Mode: Oscilloscope", COLOR_BLACK, COLOR_WHITE);
+    HAL_Delay(1000);
   /* USER CODE END 2 */
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
+    /* USER CODE BEGIN WHILE */
+    char str[64];
+    static uint32_t lastTextUpdate = 0;
 
+    while (1) {
+        // === ОБНОВЛЕНИЕ КНОПОК ===
+        buttons.update();
+
+        uint32_t now = HAL_GetTick();
+
+        // === ОБНОВЛЕНИЕ ПОТЕНЦИОМЕТРОВ ===
+        potReader.update();
+
+        // === ОБНОВЛЕНИЕ МЕНЮ ===
+        menu.update(currentMode);
+
+        // === ЕСЛИ МЕНЮ ОТКРЫТО - пропускаем остальной код ===
+        if (menu.isVisible()) {
+            if (menu.isFrequencyChanged()) {
+                fixedFrequency = menu.getFrequency();
+                uart.setFrequency(fixedFrequency);
+            }
+            if (menu.isOffsetChanged()) {
+                setOffset(menu.getOffset());
+            }
+            if (menu.isScanCenterChanged()) {
+                scanner.setCenter(menu.getScanCenter());
+            }
+
+            menu.resetFlags();
+
+            HAL_Delay(20);
+            continue;
+        }
+
+        // === ПРИМЕНЕНИЕ СМЕЩЕНИЯ A0 ===
+        static uint32_t lastOffsetUpdate = 0;
+        static uint8_t lastOffsetValue = 128;
+
+        if (now - lastOffsetUpdate >= 50) {
+            lastOffsetUpdate = now;
+            uint8_t offsetValue = (uint8_t)(potReader.getOffsetPercent() * 255.0f);
+
+            if (offsetValue != lastOffsetValue) {
+                lastOffsetValue = offsetValue;
+                setOffset(offsetValue);
+            }
+        }
+
+        // === КНОПКА BTN1: ПЕРЕКЛЮЧЕНИЕ РЕЖИМА ===
+        ButtonManager::ButtonEvent evt1 = buttons.getEvent(ButtonManager::BTN1);
+        if (evt1 == ButtonManager::PRESSED) {
+            currentMode = !currentMode;
+            display.clear(COLOR_WHITE);
+
+            if (currentMode == 0) {
+                display.drawString(0, 0, "MODE: OSCILLOSCOPE", COLOR_BLACK, COLOR_WHITE);
+                sprintf(str, "F: %.1f MHz", fixedFrequency);
+                display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+                uart.setFrequency(fixedFrequency);
+            } else {
+                display.drawString(0, 0, "MODE: SCANNER", COLOR_BLACK, COLOR_WHITE);
+                display.drawString(0, 20, "BTN4=START", COLOR_BLUE, COLOR_WHITE);
+            }
+            HAL_Delay(500);
+            continue;
+        }
+
+        // ================================================================
+        // === РЕЖИМ 0: ОСЦИЛЛОГРАФ ===
+        // ================================================================
+        if (currentMode == 0) {
+            oscilloscope.capture();
+
+            display.drawOscillogramFast(oscilloscope.getBuffer(),
+                                         oscilloscope.getBufferSize(),
+                                         COLOR_RED, COLOR_WHITE);
+
+            if (now - lastTextUpdate >= 500) {
+                lastTextUpdate = now;
+
+                display.clearArea(0, 0, 160, 50, COLOR_WHITE);
+
+                sprintf(str, "AVG:%d AMP:%d", oscilloscope.getAverage(), oscilloscope.getAmplitude());
+                display.drawString(0, 0, str, COLOR_BLACK, COLOR_WHITE);
+
+                sprintf(str, "MIN:%d MAX:%d", oscilloscope.getMin(), oscilloscope.getMax());
+                display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+
+                sprintf(str, "F:%.1fMHz", fixedFrequency);
+                display.drawString(0, 20, str, COLOR_BLACK, COLOR_WHITE);
+
+                display.drawString(0, 40, "OSC MODE  BTN3=MENU", COLOR_GREEN, COLOR_WHITE);
+            }
+        }
+        // ================================================================
+        // === РЕЖИМ 1: СКАНЕР ===
+        // ================================================================
+        else {
+            scanner.update();
+
+            Scanner::State scanState = scanner.getState();
+
+            // === КНОПКА BTN4 ===
+            ButtonManager::ButtonEvent evt4 = buttons.getEvent(ButtonManager::BTN4);
+            if (evt4 == ButtonManager::PRESSED) {
+                if (scanState == Scanner::IDLE) {
+                    scanner.start();
+                    display.clear(COLOR_WHITE);
+                }
+                else if (scanState == Scanner::SCANNING) {
+                    float currentFreq = scanner.getCurrentFrequency();
+                    scanner.stop();
+                    fixedFrequency = currentFreq;
+                    uart.setFrequency(fixedFrequency);
+
+                    display.clear(COLOR_WHITE);
+                    display.drawString(0, 0, "GOTO OSC", COLOR_GREEN, COLOR_WHITE);
+                    sprintf(str, "F: %.1f MHz", fixedFrequency);
+                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+                    HAL_Delay(500);
+
+                    currentMode = 0;
+                    continue;
+                }
+                else if (scanState == Scanner::FINISHED || scanState == Scanner::STOPPED) {
+                    float gotoFreq;
+                    if (scanState == Scanner::FINISHED) {
+                        gotoFreq = scanner.getPeakFrequency();
+                    } else {
+                        gotoFreq = scanner.getStoppedFrequency();
+                    }
+
+                    fixedFrequency = gotoFreq;
+                    uart.setFrequency(fixedFrequency);
+
+                    display.clear(COLOR_WHITE);
+                    display.drawString(0, 0, "GOTO PEAK", COLOR_GREEN, COLOR_WHITE);
+                    sprintf(str, "F: %.1f MHz", fixedFrequency);
+                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+                    HAL_Delay(500);
+
+                    currentMode = 0;
+                    continue;
+                }
+            }
+
+            // === КНОПКА BTN2: перезапуск ===
+            ButtonManager::ButtonEvent evt2 = buttons.getEvent(ButtonManager::BTN2);
+            if (evt2 == ButtonManager::PRESSED) {
+                if (scanState == Scanner::FINISHED || scanState == Scanner::STOPPED) {
+                    scanner.start();
+                    display.clear(COLOR_WHITE);
+                }
+            }
+
+            // === ОТРИСОВКА ===
+
+            if (scanState == Scanner::IDLE) {
+                if (now - lastTextUpdate >= 500) {
+                    lastTextUpdate = now;
+                    // БЕЗ clearArea — пишем поверх с белым фоном
+                    display.drawString(0, 0, "SCANNER READY   ", COLOR_BLACK, COLOR_WHITE);
+                    sprintf(str, "Center:%6.1fMHz ", menu.getScanCenter());
+                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+                    display.drawString(0, 20, "Span: 160 MHz   ", COLOR_BLACK, COLOR_WHITE);
+                    display.drawString(0, 35, "BTN4=START      ", COLOR_BLUE, COLOR_WHITE);
+                }
+            }
+            else if (scanState == Scanner::SCANNING) {
+                // === РИСУЕМ ТОЧКУ ===
+                uint16_t currentIdx = scanner.getCurrentIndex();
+                if (currentIdx > 0 && currentIdx <= 160) {
+                    const uint16_t* results = scanner.getResults();
+                    uint16_t level = results[currentIdx - 1];
+
+                    // === ОБЛАСТЬ ГРАФИКА: с 20 до 126 (сдвинуто вверх) ===
+                    const uint16_t graphTop = 20;
+                    const uint16_t graphBottom = 126;
+                    const uint16_t graphHeight = graphBottom - graphTop;
+
+                    // === АВТОМАСШТАБИРОВАНИЕ по максимальному уровню ===
+                    uint16_t maxLevel = scanner.getMaxLevel();
+                    uint16_t barHeight = 0;
+                    if (maxLevel > 0) {
+                        barHeight = (uint32_t)level * graphHeight / maxLevel;
+                    }
+                    if (barHeight > graphHeight) barHeight = graphHeight;
+
+                    // Минимальная высота 1 пиксель
+                    if (barHeight == 0 && level > 0) barHeight = 1;
+
+                    // === РИСУЕМ СТОЛБИК ===
+                    uint16_t x = currentIdx - 1;
+                    for (uint16_t y = 0; y < barHeight; y++) {
+                        display.drawPixel(x, graphBottom - y, COLOR_RED);
+                    }
+
+                    // === РИСУЕМ ЛИНИЮ ПОВЕРХ (чтобы видеть провалы) ===
+                    if (currentIdx >= 2) {
+                        uint16_t prevLevel = results[currentIdx - 2];
+                        uint16_t prevBarHeight = 0;
+                        if (maxLevel > 0) {
+                            prevBarHeight = (uint32_t)prevLevel * graphHeight / maxLevel;
+                        }
+                        if (prevBarHeight > graphHeight) prevBarHeight = graphHeight;
+                        if (prevBarHeight == 0 && prevLevel > 0) prevBarHeight = 1;
+
+                        uint16_t prevY = graphBottom - prevBarHeight;
+                        uint16_t currY = graphBottom - barHeight;
+
+                        // Рисуем вертикальную линию между соседними точками
+                        uint16_t yStart = (prevY < currY) ? prevY : currY;
+                        uint16_t yEnd = (prevY > currY) ? prevY : currY;
+                        for (uint16_t y = yStart; y <= yEnd; y++) {
+                            display.drawPixel(x, y, COLOR_BLUE);
+                        }
+                    }
+                }
+
+                // === ТЕКСТ БЕЗ ОЧИСТКИ ===
+                if (now - lastTextUpdate >= 500) {
+                    lastTextUpdate = now;
+
+                    sprintf(str, "SCAN %3d%%      ", scanner.getProgress());
+                    display.drawString(0, 0, str, COLOR_BLACK, COLOR_WHITE);
+
+                    sprintf(str, "F:%7.1f MHz ", scanner.getCurrentFrequency());
+                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+
+                    uint16_t level = 0;
+                    uint16_t idx = scanner.getCurrentIndex();
+                    if (idx > 0) {
+                        level = scanner.getResults()[idx - 1];
+                    }
+                    sprintf(str, "LVL:%4d MAX:%4d", level, scanner.getMaxLevel());
+                    display.drawString(0, 20, str, COLOR_BLUE, COLOR_WHITE);
+
+                    display.drawString(0, 35, "BTN4=STOP     ", COLOR_GREEN, COLOR_WHITE);
+                }
+            }
+            else if (scanState == Scanner::FINISHED) {
+                if (now - lastTextUpdate >= 500) {
+                    lastTextUpdate = now;
+                    // БЕЗ clearArea
+                    sprintf(str, "PEAK:%6.1f MHz ", scanner.getPeakFrequency());
+                    display.drawString(0, 0, str, COLOR_GREEN, COLOR_WHITE);
+
+                    sprintf(str, "Level:%4d      ", scanner.getMaxLevel());
+                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+
+                    display.drawString(0, 25, "BTN4=GOTO PEAK  ", COLOR_BLUE, COLOR_WHITE);
+                    display.drawString(0, 35, "BTN2=RESCAN     ", COLOR_BLUE, COLOR_WHITE);
+                }
+            }
+            else if (scanState == Scanner::STOPPED) {
+                if (now - lastTextUpdate >= 500) {
+                    lastTextUpdate = now;
+                    // БЕЗ clearArea
+                    sprintf(str, "STOPPED@%6.1f  ", scanner.getStoppedFrequency());
+                    display.drawString(0, 0, str, COLOR_YELLOW, COLOR_WHITE);
+
+                    display.drawString(0, 15, "BTN4=GOTO OSC   ", COLOR_BLUE, COLOR_WHITE);
+                    display.drawString(0, 25, "BTN2=RESCAN     ", COLOR_BLUE, COLOR_WHITE);
+                }
+            }
+        }
+
+        HAL_Delay(20);
+    }
+    /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
-  }
   /* USER CODE END 3 */
 }
 
@@ -143,6 +504,11 @@ void SystemClock_Config(void)
 
   /** Configure the main internal regulator output voltage
   */
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
+
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE0);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
@@ -237,12 +603,12 @@ static void MX_ADC1_Init(void)
   */
   hadc1.Instance = ADC1;
   hadc1.Init.ClockPrescaler = ADC_CLOCK_ASYNC_DIV2;
-  hadc1.Init.Resolution = ADC_RESOLUTION_8B;
-  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
-  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SEQ_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
-  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.NbrOfConversion = 2;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
@@ -250,7 +616,6 @@ static void MX_ADC1_Init(void)
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
   hadc1.Init.OversamplingMode = DISABLE;
-  hadc1.Init.Oversampling.Ratio = 1;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
     Error_Handler();
@@ -266,12 +631,21 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_14;
+  sConfig.Channel = ADC_CHANNEL_16;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_8CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_15;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
   sConfig.OffsetSignedSaturation = DISABLE;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
@@ -309,7 +683,7 @@ static void MX_ADC2_Init(void)
   hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc2.Init.LowPowerAutoWait = DISABLE;
-  hadc2.Init.ContinuousConvMode = ENABLE;
+  hadc2.Init.ContinuousConvMode = DISABLE;
   hadc2.Init.NbrOfConversion = 1;
   hadc2.Init.DiscontinuousConvMode = DISABLE;
   hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
@@ -318,7 +692,6 @@ static void MX_ADC2_Init(void)
   hadc2.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc2.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
   hadc2.Init.OversamplingMode = DISABLE;
-  hadc2.Init.Oversampling.Ratio = 1;
   if (HAL_ADC_Init(&hadc2) != HAL_OK)
   {
     Error_Handler();
@@ -413,7 +786,7 @@ static void MX_TIM3_Init(void)
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 0;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 65535;
+  htim3.Init.Period = 255;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
@@ -467,7 +840,7 @@ static void MX_UART5_Init(void)
   /* USER CODE END UART5_Init 1 */
   huart5.Instance = UART5;
   huart5.Init.BaudRate = 9600;
-  huart5.Init.WordLength = UART_WORDLENGTH_9B;
+  huart5.Init.WordLength = UART_WORDLENGTH_8B;
   huart5.Init.StopBits = UART_STOPBITS_1;
   huart5.Init.Parity = UART_PARITY_EVEN;
   huart5.Init.Mode = UART_MODE_TX_RX;
@@ -517,6 +890,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Stream2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Stream2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream2_IRQn);
+  /* DMA1_Stream3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream3_IRQn);
 
 }
 
@@ -528,9 +904,8 @@ static void MX_DMA_Init(void)
 static void MX_GPIO_Init(void)
 {
   LL_GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
+/* USER CODE BEGIN MX_GPIO_Init_1 */
+/* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   LL_AHB4_GRP1_EnableClock(LL_AHB4_GRP1_PERIPH_GPIOE);
@@ -543,13 +918,13 @@ static void MX_GPIO_Init(void)
                           |CS_DISPL_Pin);
 
   /**/
-  GPIO_InitStruct.Pin = BUTTON_3_Pin|BUTTON_4_Pin;
+  GPIO_InitStruct.Pin = BUTTON_4_Pin|BUTTON_3_Pin;
   GPIO_InitStruct.Mode = LL_GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
   LL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /**/
-  GPIO_InitStruct.Pin = BUTTON_1_Pin|BUTTON_2_Pin;
+  GPIO_InitStruct.Pin = BUTTON_2_Pin|BUTTON_1_Pin;
   GPIO_InitStruct.Mode = LL_GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = LL_GPIO_PULL_NO;
   LL_GPIO_Init(GPIOC, &GPIO_InitStruct);
@@ -572,13 +947,11 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = LL_GPIO_AF_10;
   LL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
+/* USER CODE BEGIN MX_GPIO_Init_2 */
+/* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-
 /* USER CODE END 4 */
 
 /**
@@ -595,7 +968,8 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-#ifdef USE_FULL_ASSERT
+
+#ifdef  USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
   *         where the assert_param error has occurred.
