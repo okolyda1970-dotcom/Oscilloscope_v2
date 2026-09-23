@@ -57,6 +57,15 @@ DMA_HandleTypeDef hdma_uart5_rx;
 
 /* USER CODE BEGIN PV */
 
+
+// === МАССИВ ДЛЯ ОДИНОЧНОГО СКАНЕРА ===
+uint16_t singleAdcBuffer[1024];
+volatile bool singleAdcReady = false;
+
+// === ОТЛАДОЧНЫЙ МАССИВ АЦП ===
+uint16_t debugAdcBuffer[1024];
+volatile bool debugAdcReady = false;
+
 // === БУФЕРЫ АЦП ===
 uint16_t adcBuffer[ADC_BUFFER_SIZE];   // Буфер детектора сигнала
 uint16_t potBuffer[2];                  // Буфер потенциометров (A0, A1)
@@ -69,18 +78,19 @@ UartProtocol uart(&huart5);
 Display display(&hspi1, GPIOB, GPIO_PIN_8, GPIOB, GPIO_PIN_6, GPIOB, GPIO_PIN_7);
 
 // === МЕНЕДЖЕР КНОПОК (исправленный порядок) ===
-ButtonManager buttons(BUTTON_2_GPIO_Port, BUTTON_2_Pin,   // BTN1 (физически кнопка 2)
-                      BUTTON_1_GPIO_Port, BUTTON_1_Pin,   // BTN2 (физически кнопка 1)
-                      BUTTON_4_GPIO_Port, BUTTON_4_Pin,   // BTN3 (физически кнопка 4)
-                      BUTTON_3_GPIO_Port, BUTTON_3_Pin);  // BTN4 (физически кнопка 3)
+ButtonManager buttons(BUTTON_1_GPIO_Port, BUTTON_1_Pin,   // Кнопка 1 = физическая кнопка 1 (режим)
+                      BUTTON_2_GPIO_Port, BUTTON_2_Pin,   // Кнопка 2 = физическая кнопка 2 (рескан)
+                      BUTTON_3_GPIO_Port, BUTTON_3_Pin,   // Кнопка 3 = физическая кнопка 3 (меню)
+                      BUTTON_4_GPIO_Port, BUTTON_4_Pin);  // Кнопка 4 = физическая кнопка 4 (старт/стоп)
 Scanner scanner(&uart, &hadc2, adcBuffer, ADC_BUFFER_SIZE);
+
 Oscilloscope oscilloscope(&adcDetector);
 PotReader potReader(&adcPots);
 Menu menu(&display, &buttons);
 // === ФЛАГ�? ===
 volatile uint8_t flagAdc = 0;
 uint8_t currentMode = 0;
-float fixedFrequency = 900.0f;
+float fixedFrequency = Scanner::DEFAULT_CENTER_MHZ;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -128,12 +138,18 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     }
 }
 
-// === КОЛБЭК АЦП ===
+/*// === КОЛБЭК АЦП ===
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
 	// ПРАВ�?ЛЬНО:
 	AdcDma::convCpltCallback(hadc);
+}*/
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {
+    if (hadc->Instance == ADC2) {
+        debugAdcReady = true;
+        singleAdcReady = true;  // ← Добавили для одиночного сканера
+    }
+    AdcDma::convCpltCallback(hadc);
 }
-
 // === УСТАНОВКА УРОВНЯ СМЕЩЕН�?Я ОУ ===
 void setOffset(uint8_t value) {
     __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, value);
@@ -202,7 +218,7 @@ int main(void)
     HAL_Delay(1000);
 
     // === УСТАНОВКА НАЧАЛЬНОЙ ЧАСТОТЫ ===
-    uart.setFrequency(900.0);
+    uart.setFrequency(Scanner::DEFAULT_CENTER_MHZ);
     uart.setRfOutput(true);
 
     // === ГОТОВО ===
@@ -214,72 +230,46 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Infinite loop */
-    /* USER CODE BEGIN WHILE */
+  /* USER CODE BEGIN WHILE */
     char str[64];
     static uint32_t lastTextUpdate = 0;
 
+    // === ЦИКЛ ===
+    // === ЦИКЛ ===
     while (1) {
-        // === ОБНОВЛЕНИЕ КНОПОК ===
-        buttons.update();
-
         uint32_t now = HAL_GetTick();
 
-        // === ОБНОВЛЕНИЕ ПОТЕНЦИОМЕТРОВ ===
-        potReader.update();
+        // === ОБНОВЛЯЕМ КНОПКИ ===
+        buttons.update();
 
-        // === ОБНОВЛЕНИЕ МЕНЮ ===
-        menu.update(currentMode);
-
-        // === ЕСЛИ МЕНЮ ОТКРЫТО - пропускаем остальной код ===
+        // === ОБРАБОТКА МЕНЮ ===
         if (menu.isVisible()) {
-            if (menu.isFrequencyChanged()) {
-                fixedFrequency = menu.getFrequency();
-                uart.setFrequency(fixedFrequency);
-            }
-            if (menu.isOffsetChanged()) {
-                setOffset(menu.getOffset());
-            }
-            if (menu.isScanCenterChanged()) {
-                scanner.setCenter(menu.getScanCenter());
-            }
+            menu.update(currentMode);
+            continue;  // Пропускаем всё остальное, пока меню открыто
+        }
 
-            menu.resetFlags();
-
-            HAL_Delay(20);
+        // === Кнопка 3: Открыть меню ===
+        ButtonManager::ButtonEvent evt3 = buttons.getEvent(ButtonManager::BTN3);
+        if (evt3 == ButtonManager::PRESSED || evt3 == ButtonManager::LONG_PRESS) {
+            menu.show();
             continue;
         }
 
-        // === ПРИМЕНЕНИЕ СМЕЩЕНИЯ A0 ===
-        static uint32_t lastOffsetUpdate = 0;
-        static uint8_t lastOffsetValue = 128;
-
-        if (now - lastOffsetUpdate >= 50) {
-            lastOffsetUpdate = now;
-            uint8_t offsetValue = (uint8_t)(potReader.getOffsetPercent() * 255.0f);
-
-            if (offsetValue != lastOffsetValue) {
-                lastOffsetValue = offsetValue;
-                setOffset(offsetValue);
-            }
-        }
-
-        // === КНОПКА BTN1: ПЕРЕКЛЮЧЕНИЕ РЕЖИМА ===
+        // === Кнопка 1: Переключение режима (3 режима) ===
         ButtonManager::ButtonEvent evt1 = buttons.getEvent(ButtonManager::BTN1);
         if (evt1 == ButtonManager::PRESSED) {
-            currentMode = !currentMode;
+            currentMode = (currentMode + 1) % 3;  // 0->1->2->0
             display.clear(COLOR_WHITE);
 
+            // Сбрасываем состояния
             if (currentMode == 0) {
-                display.drawString(0, 0, "MODE: OSCILLOSCOPE", COLOR_BLACK, COLOR_WHITE);
-                sprintf(str, "F: %.1f MHz", fixedFrequency);
-                display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
-                uart.setFrequency(fixedFrequency);
+                display.drawString(0, 0, "OSCILLOSCOPE", COLOR_BLACK, COLOR_WHITE);
+            } else if (currentMode == 1) {
+                display.drawString(0, 0, "SCANNER", COLOR_BLACK, COLOR_WHITE);
+                scanner.start();  // ← АВТОЗАПУСК сканера
             } else {
-                display.drawString(0, 0, "MODE: SCANNER", COLOR_BLACK, COLOR_WHITE);
-                display.drawString(0, 20, "BTN4=START", COLOR_BLUE, COLOR_WHITE);
+                display.drawString(0, 0, "SINGLE SCAN", COLOR_BLACK, COLOR_WHITE);
             }
-            HAL_Delay(500);
-            continue;
         }
 
         // ================================================================
@@ -306,96 +296,30 @@ int main(void)
                 sprintf(str, "F:%.1fMHz", fixedFrequency);
                 display.drawString(0, 20, str, COLOR_BLACK, COLOR_WHITE);
 
-                display.drawString(0, 40, "OSC MODE  BTN3=MENU", COLOR_GREEN, COLOR_WHITE);
+                display.drawString(0, 40, "OSC MODE", COLOR_GREEN, COLOR_WHITE);
             }
         }
+
         // ================================================================
-        // === РЕЖИМ 1: СКАНЕР ===
+        // === РЕЖИМ 1: СКАНЕР (с перестройкой частоты) ===
         // ================================================================
-        else {
+        else if (currentMode == 1) {
             scanner.update();
 
-            Scanner::State scanState = scanner.getState();
+            // Получаем текущее состояние сканера
+            Scanner::State state = scanner.getState();
 
-            // === КНОПКА BTN4 ===
-            ButtonManager::ButtonEvent evt4 = buttons.getEvent(ButtonManager::BTN4);
-            if (evt4 == ButtonManager::PRESSED) {
-                if (scanState == Scanner::IDLE) {
-                    scanner.start();
-                    display.clear(COLOR_WHITE);
-                }
-                else if (scanState == Scanner::SCANNING) {
-                    float currentFreq = scanner.getCurrentFrequency();
-                    scanner.stop();
-                    fixedFrequency = currentFreq;
-                    uart.setFrequency(fixedFrequency);
+            // === Параметры графика ===
+            const uint16_t graphTop = 20;
+            const uint16_t graphBottom = 126;
+            const uint16_t graphHeight = graphBottom - graphTop;
 
-                    display.clear(COLOR_WHITE);
-                    display.drawString(0, 0, "GOTO OSC", COLOR_GREEN, COLOR_WHITE);
-                    sprintf(str, "F: %.1f MHz", fixedFrequency);
-                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
-                    HAL_Delay(500);
-
-                    currentMode = 0;
-                    continue;
-                }
-                else if (scanState == Scanner::FINISHED || scanState == Scanner::STOPPED) {
-                    float gotoFreq;
-                    if (scanState == Scanner::FINISHED) {
-                        gotoFreq = scanner.getPeakFrequency();
-                    } else {
-                        gotoFreq = scanner.getStoppedFrequency();
-                    }
-
-                    fixedFrequency = gotoFreq;
-                    uart.setFrequency(fixedFrequency);
-
-                    display.clear(COLOR_WHITE);
-                    display.drawString(0, 0, "GOTO PEAK", COLOR_GREEN, COLOR_WHITE);
-                    sprintf(str, "F: %.1f MHz", fixedFrequency);
-                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
-                    HAL_Delay(500);
-
-                    currentMode = 0;
-                    continue;
-                }
-            }
-
-            // === КНОПКА BTN2: перезапуск ===
-            ButtonManager::ButtonEvent evt2 = buttons.getEvent(ButtonManager::BTN2);
-            if (evt2 == ButtonManager::PRESSED) {
-                if (scanState == Scanner::FINISHED || scanState == Scanner::STOPPED) {
-                    scanner.start();
-                    display.clear(COLOR_WHITE);
-                }
-            }
-
-            // === ОТРИСОВКА ===
-
-            if (scanState == Scanner::IDLE) {
-                if (now - lastTextUpdate >= 500) {
-                    lastTextUpdate = now;
-                    // БЕЗ clearArea — пишем поверх с белым фоном
-                    display.drawString(0, 0, "SCANNER READY   ", COLOR_BLACK, COLOR_WHITE);
-                    sprintf(str, "Center:%6.1fMHz ", menu.getScanCenter());
-                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
-                    display.drawString(0, 20, "Span: 160 MHz   ", COLOR_BLACK, COLOR_WHITE);
-                    display.drawString(0, 35, "BTN4=START      ", COLOR_BLUE, COLOR_WHITE);
-                }
-            }
-            else if (scanState == Scanner::SCANNING) {
-                // === РИСУЕМ ТОЧКУ ===
+            if (state == Scanner::SCANNING) {
+                // Рисуем текущий столбик
                 uint16_t currentIdx = scanner.getCurrentIndex();
-                if (currentIdx > 0 && currentIdx <= 160) {
-                    const uint16_t* results = scanner.getResults();
-                    uint16_t level = results[currentIdx - 1];
+                if (currentIdx > 0) {
+                    uint16_t level = scanner.getResults()[currentIdx - 1];
 
-                    // === ОБЛАСТЬ ГРАФИКА: с 20 до 126 (сдвинуто вверх) ===
-                    const uint16_t graphTop = 20;
-                    const uint16_t graphBottom = 126;
-                    const uint16_t graphHeight = graphBottom - graphTop;
-
-                    // === АВТОМАСШТАБИРОВАНИЕ по максимальному уровню ===
                     uint16_t maxLevel = scanner.getMaxLevel();
                     uint16_t barHeight = 0;
                     if (maxLevel > 0) {
@@ -403,88 +327,178 @@ int main(void)
                     }
                     if (barHeight > graphHeight) barHeight = graphHeight;
 
-                    // Минимальная высота 1 пиксель
-                    if (barHeight == 0 && level > 0) barHeight = 1;
-
-                    // === РИСУЕМ СТОЛБИК ===
+                    // Рисуем столбик
                     uint16_t x = currentIdx - 1;
                     for (uint16_t y = 0; y < barHeight; y++) {
                         display.drawPixel(x, graphBottom - y, COLOR_RED);
                     }
 
-                    // === РИСУЕМ ЛИНИЮ ПОВЕРХ (чтобы видеть провалы) ===
-                    if (currentIdx >= 2) {
-                        uint16_t prevLevel = results[currentIdx - 2];
+                    // Соединяем линией
+                    if (currentIdx > 1) {
+                        uint16_t prevLevel = scanner.getResults()[currentIdx - 2];
                         uint16_t prevBarHeight = 0;
                         if (maxLevel > 0) {
                             prevBarHeight = (uint32_t)prevLevel * graphHeight / maxLevel;
                         }
                         if (prevBarHeight > graphHeight) prevBarHeight = graphHeight;
-                        if (prevBarHeight == 0 && prevLevel > 0) prevBarHeight = 1;
 
                         uint16_t prevY = graphBottom - prevBarHeight;
                         uint16_t currY = graphBottom - barHeight;
-
-                        // Рисуем вертикальную линию между соседними точками
-                        uint16_t yStart = (prevY < currY) ? prevY : currY;
-                        uint16_t yEnd = (prevY > currY) ? prevY : currY;
-                        for (uint16_t y = yStart; y <= yEnd; y++) {
-                            display.drawPixel(x, y, COLOR_BLUE);
-                        }
+                        display.drawLine(x - 1, prevY, x, currY, COLOR_BLUE, 1);
                     }
                 }
 
-                // === ТЕКСТ БЕЗ ОЧИСТКИ ===
-                if (now - lastTextUpdate >= 500) {
+                // Выводим прогресс
+                if (now - lastTextUpdate >= 200) {
                     lastTextUpdate = now;
+                    display.clearArea(0, 0, 160, 50, COLOR_WHITE);
 
-                    sprintf(str, "SCAN %3d%%      ", scanner.getProgress());
+                    uint16_t currentIdx = scanner.getCurrentIndex();
+                    sprintf(str, "SCAN %3d%%", (currentIdx * 100) / 160);
                     display.drawString(0, 0, str, COLOR_BLACK, COLOR_WHITE);
 
-                    sprintf(str, "F:%7.1f MHz ", scanner.getCurrentFrequency());
+                    sprintf(str, "F:%.1fMHz", scanner.getCurrentFrequency());
                     display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
 
-                    uint16_t level = 0;
-                    uint16_t idx = scanner.getCurrentIndex();
-                    if (idx > 0) {
-                        level = scanner.getResults()[idx - 1];
-                    }
+                    uint16_t level = (currentIdx > 0) ? scanner.getResults()[currentIdx - 1] : 0;
                     sprintf(str, "LVL:%4d MAX:%4d", level, scanner.getMaxLevel());
                     display.drawString(0, 20, str, COLOR_BLUE, COLOR_WHITE);
 
-                    display.drawString(0, 35, "BTN4=STOP     ", COLOR_GREEN, COLOR_WHITE);
+                    display.drawString(0, 40, "SCANNING...", COLOR_GREEN, COLOR_WHITE);
                 }
             }
-            else if (scanState == Scanner::FINISHED) {
-                if (now - lastTextUpdate >= 500) {
+            else if (state == Scanner::FINISHED) {
+                // Сканирование завершено
+                if (now - lastTextUpdate >= 1000) {
                     lastTextUpdate = now;
-                    // БЕЗ clearArea
-                    sprintf(str, "PEAK:%6.1f MHz ", scanner.getPeakFrequency());
-                    display.drawString(0, 0, str, COLOR_GREEN, COLOR_WHITE);
+                    display.clearArea(0, 0, 160, 50, COLOR_WHITE);
 
-                    sprintf(str, "Level:%4d      ", scanner.getMaxLevel());
+                    float peakFreq = scanner.getPeakFrequency();
+                    sprintf(str, "PEAK:%.1fMHz", peakFreq);
+                    display.drawString(0, 0, str, COLOR_RED, COLOR_WHITE);
+
+                    sprintf(str, "MaxLevel:%d", scanner.getMaxLevel());
                     display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
 
-                    display.drawString(0, 25, "BTN4=GOTO PEAK  ", COLOR_BLUE, COLOR_WHITE);
-                    display.drawString(0, 35, "BTN2=RESCAN     ", COLOR_BLUE, COLOR_WHITE);
+                    display.drawString(0, 20, "SCAN DONE", COLOR_GREEN, COLOR_WHITE);
+                    display.drawString(0, 40, "BTN2:Rescan", COLOR_BLUE, COLOR_WHITE);
                 }
             }
-            else if (scanState == Scanner::STOPPED) {
+            else {
+                // Ожидание старта
                 if (now - lastTextUpdate >= 500) {
                     lastTextUpdate = now;
-                    // БЕЗ clearArea
-                    sprintf(str, "STOPPED@%6.1f  ", scanner.getStoppedFrequency());
-                    display.drawString(0, 0, str, COLOR_YELLOW, COLOR_WHITE);
+                    display.clearArea(0, 0, 160, 50, COLOR_WHITE);
 
-                    display.drawString(0, 15, "BTN4=GOTO OSC   ", COLOR_BLUE, COLOR_WHITE);
-                    display.drawString(0, 25, "BTN2=RESCAN     ", COLOR_BLUE, COLOR_WHITE);
+                    display.drawString(0, 0, "SCANNER READY", COLOR_BLACK, COLOR_WHITE);
+
+                    sprintf(str, "Center:137.5MHz");
+                    display.drawString(0, 10, str, COLOR_BLACK, COLOR_WHITE);
+
+                    sprintf(str, "Span:160MHz");
+                    display.drawString(0, 20, str, COLOR_BLACK, COLOR_WHITE);
+
+                    display.drawString(0, 40, "BTN4:Start", COLOR_GREEN, COLOR_WHITE);
+                }
+            }
+
+            // Кнопка 2: Рескан
+            ButtonManager::ButtonEvent evt2 = buttons.getEvent(ButtonManager::BTN2);
+            if (evt2 == ButtonManager::PRESSED) {
+                scanner.start();
+            }
+
+            // Кнопка 4: Старт/Стоп/Выбор пика
+            ButtonManager::ButtonEvent evt4 = buttons.getEvent(ButtonManager::BTN4);
+            if (evt4 == ButtonManager::PRESSED) {
+                Scanner::State state = scanner.getState();
+                if (state == Scanner::IDLE || state == Scanner::FINISHED) {
+                    scanner.start();
+                } else if (state == Scanner::SCANNING) {
+                    scanner.stop();
                 }
             }
         }
 
-        HAL_Delay(20);
+        // ================================================================
+        // === РЕЖИМ 2: ОДИНОЧНЫЙ СКАНЕР (фиксированная частота) ===
+        // ================================================================
+        else if (currentMode == 2) {
+            // === Устанавливаем частоту один раз ===
+            static bool singleFreqSet = false;
+            static bool singleAdcStarted = false;
+            static uint16_t singleLastBarHeight = 0;
+
+            if (!singleFreqSet) {
+                uart.setFrequency(1000.0);  // Фиксированная частота 1000 МГц
+                uart.setRfOutput(true);
+                singleFreqSet = true;
+                singleAdcStarted = false;
+                singleLastBarHeight = 0;
+                display.clear(COLOR_WHITE);
+                display.drawString(0, 0, "SINGLE 1000MHz", COLOR_BLACK, COLOR_WHITE);
+            }
+
+            // === Запускаем АЦП через DMA ===
+            if (!singleAdcStarted) {
+                singleAdcReady = false;
+                HAL_ADC_Stop_DMA(&hadc2);
+                HAL_Delay(1);
+                HAL_ADC_Start_DMA(&hadc2, (uint32_t*)singleAdcBuffer, 1024);
+                singleAdcStarted = true;
+            }
+
+            // === Ждём завершения ===
+            if (singleAdcReady) {
+                singleAdcReady = false;
+                singleAdcStarted = false;
+
+                // === Ищем максимум в массиве 1024 ===
+                uint16_t maxVal = 0;
+                for (uint16_t j = 0; j < 1024; j++) {
+                    if (singleAdcBuffer[j] > maxVal) {
+                        maxVal = singleAdcBuffer[j];
+                    }
+                }
+
+                // === Высота столбика ===
+                uint16_t barHeight = maxVal;
+                if (barHeight > 100) barHeight = 100;
+
+                // === Оптимизация: стираем только старый столбик ===
+                const uint16_t centerX = 80;
+                const uint16_t graphBottom = 120;
+                const uint16_t maxWidth = 3;
+
+                if (barHeight != singleLastBarHeight) {
+                    // Стираем старый столбик
+                    display.fillRectFast(centerX - maxWidth, graphBottom - singleLastBarHeight,
+                                         maxWidth * 2, singleLastBarHeight, COLOR_WHITE);
+
+                    // Рисуем новый столбик
+                    display.fillRectFast(centerX - 1, graphBottom - barHeight, 2, barHeight, COLOR_RED);
+
+                    singleLastBarHeight = barHeight;
+
+                    // Выводим значения
+                    char dbgStr[64];
+                    sprintf(dbgStr, "MAX: %d", maxVal);
+                    display.drawString(0, 10, dbgStr, COLOR_BLUE, COLOR_WHITE);
+
+                    sprintf(dbgStr, "BAR: %d", barHeight);
+                    display.drawString(70, 10, dbgStr, COLOR_BLUE, COLOR_WHITE);
+                }
+            }
+
+            // Текст внизу
+            if (now - lastTextUpdate >= 500) {
+                lastTextUpdate = now;
+                display.drawString(0, 40, "SINGLE MODE", COLOR_GREEN, COLOR_WHITE);
+            }
+        }
     }
     /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
   /* USER CODE END 3 */
 }
@@ -683,12 +697,12 @@ static void MX_ADC2_Init(void)
   hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
   hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc2.Init.LowPowerAutoWait = DISABLE;
-  hadc2.Init.ContinuousConvMode = DISABLE;
+  hadc2.Init.ContinuousConvMode = ENABLE;
   hadc2.Init.NbrOfConversion = 1;
   hadc2.Init.DiscontinuousConvMode = DISABLE;
   hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc2.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DMA_ONESHOT;
+  hadc2.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DMA_CIRCULAR;
   hadc2.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc2.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
   hadc2.Init.OversamplingMode = DISABLE;
