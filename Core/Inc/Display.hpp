@@ -108,6 +108,7 @@ public:
     void setGain(float newGain);
     float getGain() const;
     void drawScanGraph(const uint16_t* data, uint16_t length, uint16_t maxVal);
+    void fillRectFast(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color);
 
 private:
     uint16_t triggerLevel = 64;
