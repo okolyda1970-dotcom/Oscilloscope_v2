@@ -449,3 +449,7 @@ void Display::drawScanGraph(const uint16_t* data, uint16_t length, uint16_t maxV
                      ST7735_WIDTH * graphHeight * 2, HAL_MAX_DELAY);
     unselect();
 }
+
+void Display::fillRectFast(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color) {
+    ST7735_FillRectangleFast(x, y, w, h, color);
+}
